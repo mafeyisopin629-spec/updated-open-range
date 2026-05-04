@@ -21,6 +21,7 @@ import openrange as OR
 MANIFEST: dict[str, object] = {
     "world": {"goal": "find the admin flag in a vulnerable webapp"},
     "pack": {"id": "cyber.webapp", "source": {"kind": "builtin"}},
+    "runtime": {"tick": {"mode": "auto", "rate_hz": 1.5}},
     "npc": [
         {
             "type": "cyber.browsing_user",

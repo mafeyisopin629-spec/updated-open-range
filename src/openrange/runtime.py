@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from openrange.agent_backend import AgentBackend
 from openrange.core import (
     Manifest,
     Snapshot,
@@ -45,6 +46,13 @@ class RunConfig:
     reset_dashboard: bool = True
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int | None = None
+    # Backend handed to NPCs with ``requires_llm = True``. Unset →
+    # those NPCs mark themselves broken with "no backend configured".
+    npc_agent_backend: AgentBackend | None = None
+    # Convenience shorthand — auto-promoted to
+    # ``StrandsAgentBackend(model=npc_llm_model)``. Mutually exclusive
+    # with ``npc_agent_backend``.
+    npc_llm_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +66,8 @@ class DashboardServerHandle:
         return f"http://{host}:{self.server.server_address[1]}"
 
     def close(self) -> None:
-        self.server.view.bridge.close()
+        if self.server.view is not None:
+            self.server.view.close()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -77,6 +86,14 @@ class OpenRangeRun:
         self.config = (
             config if isinstance(config, RunConfig) else RunConfig(Path(config))
         )
+        if (
+            self.config.npc_agent_backend is not None
+            and self.config.npc_llm_model is not None
+        ):
+            raise ValueError(
+                "RunConfig: pass either 'npc_agent_backend' or "
+                "'npc_llm_model', not both",
+            )
         self.root = self.config.root
         self.root.mkdir(parents=True, exist_ok=True)
         self._dashboard = (
@@ -128,7 +145,12 @@ class OpenRangeRun:
 
     def episode_service(self, snapshot: Snapshot) -> EpisodeService:
         view = self._ensure_dashboard_view(snapshot)
-        return EpisodeService(self.root, dashboard=view)
+        return EpisodeService(
+            self.root,
+            dashboard=view,
+            npc_agent_backend=self.config.npc_agent_backend,
+            npc_llm_model=self.config.npc_llm_model,
+        )
 
     def serve_dashboard(
         self,
