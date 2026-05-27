@@ -12,7 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
-import openrange as OR
+from openrange_pack_sdk import LLMResult, OpenRangeError, Snapshot, TaskSpec
+
+from openrange.core.episode import AgentTurn
+from openrange.runtime import OpenRangeRun, RunConfig
 
 MANIFEST: dict[str, object] = {
     "world": {"goal": "find the admin flag in a vulnerable webapp"},
@@ -30,10 +33,10 @@ DEFAULT_RUN_ROOT = Path("or-runs/strands-eval")
 
 
 class EpisodeHarness(Protocol):
-    def run(self, instruction: str, cwd: Path) -> OR.LLMResult: ...
+    def run(self, instruction: str, cwd: Path) -> LLMResult: ...
 
 
-class StrandsDependencyError(OR.OpenRangeError):
+class StrandsDependencyError(OpenRangeError):
     """Raised when optional Strands dependencies are unavailable."""
 
 
@@ -43,10 +46,10 @@ class StrandsAgentHarness:
 
     model: str | None = None
 
-    def run(self, instruction: str, cwd: Path) -> OR.LLMResult:
+    def run(self, instruction: str, cwd: Path) -> LLMResult:
         with working_directory(cwd):
             result = self.agent()(instruction)
-        return OR.LLMResult(str(getattr(result, "message", result)))
+        return LLMResult(str(getattr(result, "message", result)))
 
     def agent(self) -> Callable[[str], object]:
         try:
@@ -63,16 +66,16 @@ class StrandsAgentHarness:
 
 
 def run_task(
-    snapshot: OR.Snapshot,
-    task: OR.TaskSpec,
+    snapshot: Snapshot,
+    task: TaskSpec,
     harness: EpisodeHarness,
-    run: OR.OpenRangeRun,
+    run: OpenRangeRun,
 ) -> dict[str, object]:
     svc = run.episode_service(snapshot)
     handle = svc.start_episode(snapshot, task.id)
     try:
         agent_result = harness.run(task.instruction, svc.agent_root(handle))
-        svc.record_turn(handle, OR.AgentTurn(message=agent_result.text))
+        svc.record_turn(handle, AgentTurn(message=agent_result.text))
         episode_report = svc.stop_episode(handle)
     finally:
         svc.close()
@@ -88,8 +91,8 @@ def main() -> None:
     parser.add_argument("--no-dashboard", action="store_true")
     args = parser.parse_args()
 
-    run = OR.OpenRangeRun(
-        OR.RunConfig(
+    run = OpenRangeRun(
+        RunConfig(
             args.run_root,
             dashboard=not args.no_dashboard,
             dashboard_host=args.dashboard_host,
