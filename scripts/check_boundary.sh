@@ -30,8 +30,7 @@
 # leak (its module docstring spells out the cyber-pack coupling and a
 # follow-up to move it onto a `Pack.topology_view()` hook). The whole
 # file is excluded from the scan rather than annotated line-by-line.
-# Phase 5 does not own the dashboard/pack refactor; the exclusion goes
-# away with that follow-up.
+# The exclusion is meant to go away once the dashboard/pack refactor lands.
 
 set -euo pipefail
 
@@ -153,11 +152,24 @@ done < <(
     | sort -u
 )
 
+while IFS= read -r match; do
+  violations=$((violations + 1))
+  echo "boundary: pack-imports-openrange $match" >&2
+done < <(
+  grep -rniE \
+    --include='*.py' \
+    '^[[:space:]]*(from|import)[[:space:]]+openrange(\.|[[:space:]]|$)' \
+    packs/ 2>/dev/null \
+    | grep -vE 'openrange_pack_sdk' || true
+)
+
 if [ "$violations" -gt 0 ]; then
   echo "boundary: $violations leak(s) found." >&2
   echo "boundary: core-leaks may be tagged with '# ALLOWED_DOMAIN_LEAK:" \
     "<reason>'." >&2
   echo "boundary: proprietary-leaks must be removed — no exemption." >&2
+  echo "boundary: pack-imports-openrange must be removed — packs depend" \
+    "only on openrange-pack-sdk + graphschema." >&2
   exit 1
 fi
 

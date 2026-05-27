@@ -6,7 +6,7 @@ Three concerns:
    and produces a ``{path: source}`` mapping carrying ``app.py`` and
    ``seed.json``.
 2. ``WebappPack().realize(graph, Backing.PROCESS)`` returns a
-   ``WebappRuntimeHandle`` satisfying the ``RuntimeHandle`` Protocol.
+   ``WebappRuntime`` satisfying the ``RuntimeHandle`` Protocol.
 3. The handle's ``reset()`` materializes those files to disk, starts a
    subprocess, exposes the agent surface, and ``stop()`` cleans up.
 """
@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from typing import cast
 
 import pytest
-from cyber_webapp import WebappPack, WebappRuntimeHandle
+from cyber_webapp import WebappPack, WebappRuntime
 from cyber_webapp.codegen import _realize_graph
 from cyber_webapp.codegen.entrypoint import (
     APP_FILE_NAME,
@@ -29,8 +29,7 @@ from cyber_webapp.codegen.entrypoint import (
     SEED_FILE_NAME,
 )
 from graphschema import WorldGraph
-
-from openrange.core.pack import Backing, RuntimeHandle
+from openrange_pack_sdk import Backing, RuntimeHandle
 
 
 def _sample_graph(seed: int = 0) -> WorldGraph:
@@ -40,7 +39,7 @@ def _sample_graph(seed: int = 0) -> WorldGraph:
 
 
 def test_realize_graph_emits_app_and_seed_files() -> None:
-    """The new codegen returns a plain mapping containing both required files."""
+    """The codegen returns a plain mapping containing both required files."""
     files = _realize_graph(_sample_graph())
     assert APP_FILE_NAME in files
     assert SEED_FILE_NAME in files
@@ -99,10 +98,10 @@ def test_realize_graph_is_deterministic_in_graph() -> None:
 
 
 def test_pack_realize_returns_webapp_runtime_handle() -> None:
-    """The pack's realize() returns a concrete WebappRuntimeHandle."""
+    """The pack's realize() returns a concrete WebappRuntime."""
     graph = _sample_graph()
     handle = WebappPack().realize(graph, Backing.PROCESS)
-    assert isinstance(handle, WebappRuntimeHandle)
+    assert isinstance(handle, WebappRuntime)
 
 
 def test_pack_realize_satisfies_runtime_handle_protocol() -> None:
@@ -145,9 +144,10 @@ def test_handle_reset_materializes_files_and_starts_process() -> None:
         # generated app unlinks it after loading), but app.py must.
         env_root = Path(agent_root).parent
         assert (env_root / "pack" / APP_FILE_NAME).exists()
-        # The request log file is pre-touched so poll_events() before
-        # any HTTP traffic returns () instead of erroring.
-        assert (env_root / REQUEST_LOG_NAME).exists()
+        # The request log is pre-touched so poll_events() before any HTTP
+        # traffic returns () instead of erroring. SubprocessRuntimeHandle
+        # writes all prepared files under pack/.
+        assert (env_root / "pack" / REQUEST_LOG_NAME).exists()
     finally:
         handle.stop()
 
@@ -247,7 +247,7 @@ def test_handle_stop_cleans_up_tempdirs() -> None:
     from pathlib import Path
 
     raw = WebappPack().realize(_sample_graph(), Backing.PROCESS)
-    handle = cast(WebappRuntimeHandle, raw)
+    handle = cast(WebappRuntime, raw)
     handle.reset()
     env_root = handle._env_root
     assert env_root is not None and env_root.exists()
@@ -261,7 +261,7 @@ def test_handle_stop_cleans_up_tempdirs() -> None:
     assert not checkpoint_dir.exists()
     assert handle._env_root is None
     assert handle._agent_root is None
-    assert handle._request_log is None
+    assert handle._pack_root is None
 
 
 def test_build_discovery_reads_title_from_graph_meta() -> None:

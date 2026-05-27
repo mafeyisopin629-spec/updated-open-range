@@ -4,6 +4,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from graphschema import Issue, Ontology, WorldGraph
+from openrange_pack_sdk import (
+    Backing,
+    Builder,
+    Pack,
+    PackPrior,
+    RuntimeHandle,
+    TaskFamily,
+)
 
 from cyber_webapp.builder import WebappBuilder
 from cyber_webapp.families import WebappBuild, WebappPentest
@@ -14,15 +22,7 @@ from cyber_webapp.invariants import (
     sqli_targets_db_backed_service,
 )
 from cyber_webapp.ontology import ONTOLOGY_ID, webapp_ontology
-from cyber_webapp.realize import WebappRuntimeError, WebappRuntimeHandle
-from openrange.core.pack import (
-    Backing,
-    Builder,
-    Pack,
-    PackPrior,
-    RuntimeHandle,
-    TaskFamily,
-)
+from cyber_webapp.realize import WebappRuntime, WebappRuntimeError
 
 
 class WebappPack(Pack):
@@ -53,7 +53,7 @@ class WebappPack(Pack):
         graph: WorldGraph,
         backing: Backing,
     ) -> RuntimeHandle:
-        return WebappRuntimeHandle(graph, backing)
+        return WebappRuntime(graph, backing)
 
     def task_families(self) -> list[TaskFamily]:
         return [WebappBuild(), WebappPentest()]
@@ -66,7 +66,7 @@ __all__ = [
     "WebappPack",
     "WebappPentest",
     "WebappRuntimeError",
-    "WebappRuntimeHandle",
+    "WebappRuntime",
     "no_orphan_nodes",
     "oracle_path_exists",
     "secret_must_be_held",

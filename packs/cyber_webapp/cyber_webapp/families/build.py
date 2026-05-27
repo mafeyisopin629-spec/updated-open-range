@@ -6,12 +6,11 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from graphschema import Node, WorldGraph
-
-from openrange.core.pack import (
+from openrange_pack_sdk import (
     EpisodeReportLike,
     EpisodeResult,
     FeasibilityVerdict,
-    LLMBackendLike,
+    LLMBackend,
     Manifest,
     Mutation,
     PackPrior,
@@ -20,13 +19,11 @@ from openrange.core.pack import (
 )
 
 if TYPE_CHECKING:
-    from openrange.core.admit import Snapshot
+    from openrange_pack_sdk import Snapshot
 
 
 class WebappBuild(TaskFamily):
-    """Stub grader — `check_success` reads `endpoint_serves_200` which
-    is set from a probe of `/` (always 200), so passes do not reflect
-    agent work. See ROADMAP / cyber `webapp.build`."""
+    """`webapp.build` TaskFamily — implement a service endpoint that serves a 200."""
 
     id = "webapp.build"
     pack_id = "webapp"
@@ -45,24 +42,18 @@ class WebappBuild(TaskFamily):
         if target_endpoint is None:
             return []
         return [
-            TaskSpec(
-                id="webapp.build.0",
+            self.make_task(
                 instruction=(
                     f"Implement the {target_endpoint.attrs.get('method', 'GET')} "
                     f"{target_endpoint.attrs.get('path', '/')} endpoint in the "
                     f"{target_service.attrs.get('name', target_service.id)} service "
                     "so it serves a 200 to a valid request."
                 ),
-                entrypoints=(target_service.id,),
-                goal_nodes=(target_endpoint.id,),
-                feasibility_check="webapp.build",
-                success_check="webapp.build",
-                meta={
-                    "family": "webapp.build",
-                    "difficulty": 0.4,
-                    "target_path": target_endpoint.attrs.get("path", "/"),
-                },
-            )
+                entrypoints=target_service.id,
+                goal_nodes=target_endpoint.id,
+                difficulty=0.4,
+                meta={"target_path": target_endpoint.attrs.get("path", "/")},
+            ),
         ]
 
     def check_feasibility(
@@ -113,7 +104,7 @@ class WebappBuild(TaskFamily):
         snapshot: Snapshot,
         reports: Sequence[EpisodeReportLike],
         *,
-        llm: LLMBackendLike | None = None,
+        llm: LLMBackend | None = None,
     ) -> tuple[Mutation, ...]:
         del llm
         from cyber_webapp.mutation import available_mutations as _enumerate
