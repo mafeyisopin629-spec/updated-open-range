@@ -21,15 +21,20 @@ Status tags on each item:
 
 Browse all roadmap issues: [`label:roadmap`](https://github.com/vecna-labs/open-range/issues?q=is%3Aissue+is%3Aopen+label%3Aroadmap).
 
-## Current focus
+Two near-term priorities:
 
-Deepen the cyber pack and push toward **enterprise scale** via
-graph-driven lazy realization
-([#212](https://github.com/vecna-labs/open-range/issues/212) /
-[#235](https://github.com/vecna-labs/open-range/issues/235)). With a
-second pack now shipped (trading), the next big lift is closing the
-eval → training loop
-([#198](https://github.com/vecna-labs/open-range/issues/198)).
+1. **From eval to training.** Today OpenRange only runs *eval* loops —
+   closing them into *training* is the highest-leverage next step. That
+   means a training-integration standard for our dynamic, evolving
+   worlds ([#243](https://github.com/vecna-labs/open-range/issues/243)),
+   with open-trajectory-gym
+   ([#198](https://github.com/vecna-labs/open-range/issues/198)) as the
+   reference consumer.
+2. **Cyber depth → enterprise scale.** Deepen the cyber pack and push
+   toward enterprise scale via graph-driven lazy realization
+   ([#212](https://github.com/vecna-labs/open-range/issues/212) /
+   [#235](https://github.com/vecna-labs/open-range/issues/235)).
+
 Physical-space simulation
 ([#219](https://github.com/vecna-labs/open-range/issues/219)) is
 explicitly far-future.
@@ -119,17 +124,31 @@ A non-cyber pack proves the Pack ABC isn't accidentally cyber-shaped.
 ## Training integration
 
 Today the examples are *eval* loops. Closing them into actual
-*training* is the next big piece.
+*training* is the next big piece. Because OpenRange worlds are dynamic
+and admission-checked — they *evolve* — the integration seam carries
+more than a static gym does: the aim is a small, trainer-agnostic
+standard, `EpisodeResult` / `EpisodeReport` → (trajectory, reward) plus
+the curriculum/evolve dimension, that any trainer can consume.
 
-- 🟡 **Training-loop integration via open-trajectory-gym**
+- 🟡 **Training-integration standard for dynamic worlds**
+  ([#243](https://github.com/vecna-labs/open-range/issues/243)) —
+  define the seam + adapter protocol so many trainers plug in. Umbrella
+  for the items below.
+- 🟡 **In-house reference: open-trajectory-gym**
   ([#198](https://github.com/vecna-labs/open-range/issues/198)) —
   pair OpenRange with
-  [open-trajectory-gym](https://github.com/vecna-labs/open-trajectory-gym).
-  Headline ask. Needs a design doc on the `EpisodeReport` ↔ trajectory
-  format seam.
+  [open-trajectory-gym](https://github.com/vecna-labs/open-trajectory-gym),
+  vecna's own SFT + Online RL + GEPA trainer; the first / reference
+  consumer of the seam.
 - 🟢 **Per-domain reward adapters**
   ([#199](https://github.com/vecna-labs/open-range/issues/199)) —
-  structured `EpisodeResult` → scalar / vector reward signal.
+  structured `EpisodeResult` → scalar / vector reward signal (the
+  reward half of the seam).
+- 🟢 **Reach adapters: SkyRL / TRL**
+  ([#244](https://github.com/vecna-labs/open-range/issues/244) /
+  [#245](https://github.com/vecna-labs/open-range/issues/245)) —
+  trainer-side adapters that bridge the seam out to external trainers.
+  verl / TorchForge are later candidates.
 - 🟢 **Curriculum-driven training demo**
   ([#200](https://github.com/vecna-labs/open-range/issues/200)) —
   notebook showing success-rate curves as `evolve(...)` hardens worlds.
