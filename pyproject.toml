@@ -21,6 +21,8 @@ strands = [
     "strands-agents>=1.38.0",
     "strands-agents-tools>=0.4.1",
 ]
+# The HuggingFace TRL GRPO integration is a *separate* optional package,
+# ``packages/openrange-trl`` — OpenRange itself owns no trainer code or deps.
 
 [project.scripts]
 openrange = "openrange.__main__:main"
@@ -38,6 +40,7 @@ dev = [
     "openrange-cyber-webapp",
     "openrange-trading",
     "openrange-swe",
+    "openrange-trl",
 ]
 
 [tool.uv.workspace]
@@ -47,6 +50,7 @@ members = [
     "packs/swe",
     "packages/graphschema",
     "packages/openrange-pack-sdk",
+    "packages/openrange-trl",
 ]
 
 [tool.uv.sources]
@@ -55,6 +59,7 @@ openrange-cyber-webapp = { workspace = true }
 openrange-trading = { workspace = true }
 openrange-swe = { workspace = true }
 openrange-pack-sdk = { workspace = true }
+openrange-trl = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openrange"]
@@ -75,6 +80,7 @@ mypy_path = [
     "packs/swe",
     "packages/graphschema/src",
     "packages/openrange-pack-sdk/src",
+    "packages/openrange-trl/src",
 ]
 strict = true
 warn_unreachable = true
@@ -102,7 +108,7 @@ testpaths = [
 
 [tool.coverage.run]
 branch = true
-source = ["openrange", "openrange_pack_sdk", "cyber_webapp"]
+source = ["openrange", "openrange_pack_sdk", "cyber_webapp", "openrange_trl"]
 omit = [
     "src/openrange/__main__.py",
 ]
