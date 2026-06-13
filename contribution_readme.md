@@ -58,18 +58,6 @@ Left a comment on the issue introducing myself and expressing intent to work on 
 ## Reproduction Process
 
 ### Environment Setup
-
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
-
-### Steps to Reproduce
-
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
-
-## Reproduction Process
-
-### Environment Setup
 Cloned the fork on Windows using Git and VS Code. Installed the `uv` 
 package manager via `pip install uv`. Ran `python -m uv sync` to 
 install all 23 project dependencies successfully. The only challenge 
