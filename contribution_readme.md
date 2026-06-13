@@ -78,31 +78,62 @@ Left a comment on the issue introducing myself and expressing intent to work on 
 ## Solution Approach
 
 ### Analysis
-
-[Your analysis of the root cause - what's causing the issue?]
+The root cause is that the cyber task data structures in 
+`packs/cyber_webapp/cyber_webapp/ontology.py` and the task 
+definitions in `packs/cyber_webapp/cyber_webapp/families/pentest.py` 
+have no `technique_id` field. There is no classifier anywhere in the 
+codebase that maps commands to MITRE ATT&CK technique IDs. Running 
+`grep -r "technique_id"` returns zero results across the entire 
+codebase, confirming the feature is completely missing.
 
 ### Proposed Solution
-
-[High-level description of your fix approach]
+Create a new Python-based `TechniqueClassifier` that reads from a 
+YAML config file to map cyber task commands (e.g. "nmap", "sqlmap") 
+to their corresponding MITRE ATT&CK technique IDs (e.g. T1046, 
+T1190). Then update the ontology and task family definitions to 
+store and return the technique ID alongside each generated task.
 
 ### Implementation Plan
-
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** 
+When the AI agent generates cyber tasks, those tasks are stored as 
+plain strings with no security taxonomy attached. The MITRE ATT&CK 
+framework provides standardized technique IDs that would make these 
+tasks comparable to industry benchmarks. This feature is completely 
+absent from the codebase.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:** 
+The `ontology.py` file already defines structured attributes using 
+`AttrSpec` and `AttrType` — the same pattern will be used to add a 
+`technique_id` field. The `families/pentest.py` file is where 
+individual task families are defined and is where MITRE mappings 
+will be added.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:**
+1. Create `packs/cyber_webapp/cyber_webapp/mitre_techniques.yaml` 
+   — YAML file containing command-to-technique-ID mappings
+2. Create `packs/cyber_webapp/cyber_webapp/technique_classifier.py` 
+   — Python classifier that reads the YAML and maps commands to IDs
+3. Update `ontology.py` to add a `technique_id` attribute to 
+   relevant node kinds
+4. Update `families/pentest.py` to call the classifier and tag 
+   generated tasks with the appropriate technique ID
+5. Add unit tests in `packs/cyber_webapp/tests/` to verify 
+   correct tagging behavior
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** 
+https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** 
+Will self-review against `CONTRIBUTING.md` and ensure commit 
+messages follow the project's `feat:` prefix convention. Will 
+verify code style passes `ruff` linting before opening PR.
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** 
+Run `pytest packs/cyber_webapp/` to confirm new tests pass. 
+Manually verify a generated nmap task returns `technique_id: T1046`. 
+Confirm all 640 existing passing tests still pass.
 
 ---
 
