@@ -78,7 +78,7 @@ Left a comment on the issue introducing myself and expressing intent to work on 
 ## Solution Approach
 
 ### Analysis
-The root cause is that the cyber task data structures in 
+The cyber task data structures in 
 `packs/cyber_webapp/cyber_webapp/ontology.py` and the task 
 definitions in `packs/cyber_webapp/cyber_webapp/families/pentest.py` 
 have no `technique_id` field. There is no classifier anywhere in the 
@@ -87,54 +87,56 @@ codebase that maps commands to MITRE ATT&CK technique IDs. Running
 codebase, confirming the feature is completely missing.
 
 ### Proposed Solution
-Create a new Python-based `TechniqueClassifier` that reads from a 
-YAML config file to map cyber task commands (e.g. "nmap", "sqlmap") 
-to their corresponding MITRE ATT&CK technique IDs (e.g. T1046, 
-T1190). Then update the ontology and task family definitions to 
-store and return the technique ID alongside each generated task.
+Build a Python classifier that reads a YAML config file containing 
+command-to-technique mappings and automatically tags generated cyber 
+tasks with the correct MITRE ATT&CK technique ID. Update the ontology 
+to include a `technique_id` attribute and wire the classifier into the 
+task generation pipeline.
 
 ### Implementation Plan
 Using UMPIRE framework (adapted):
 
 **Understand:** 
-When the AI agent generates cyber tasks, those tasks are stored as 
-plain strings with no security taxonomy attached. The MITRE ATT&CK 
-framework provides standardized technique IDs that would make these 
-tasks comparable to industry benchmarks. This feature is completely 
-absent from the codebase.
+When the AI agent generates cyber tasks (e.g. running "nmap" or 
+"sqlmap"), those tasks are stored as plain strings with no security 
+taxonomy attached. The MITRE ATT&CK framework provides standardized 
+technique IDs (e.g. T1046 for network scanning) that would make 
+these tasks comparable to industry benchmarks. The feature is 
+completely absent from the codebase.
 
 **Match:** 
-The `ontology.py` file already defines structured attributes using 
-`AttrSpec` and `AttrType` — the same pattern will be used to add a 
-`technique_id` field. The `families/pentest.py` file is where 
-individual task families are defined and is where MITRE mappings 
-will be added.
+The `ontology.py` file already defines structured attributes for 
+cyber tasks using `AttrSpec` and `AttrType`. This is the same 
+pattern we will follow to add a `technique_id` field. The 
+`families/pentest.py` file is where individual task families are 
+defined and is where MITRE mappings will be added.
 
 **Plan:**
-1. Create `packs/cyber_webapp/cyber_webapp/mitre_techniques.yaml` 
-   — YAML file containing command-to-technique-ID mappings
-2. Create `packs/cyber_webapp/cyber_webapp/technique_classifier.py` 
-   — Python classifier that reads the YAML and maps commands to IDs
-3. Update `ontology.py` to add a `technique_id` attribute to 
+1. Create `packs/cyber_webapp/cyber_webapp/technique_classifier.py` 
+   as a new Python classifier that maps command patterns to MITRE 
+   ATT&CK technique IDs using a YAML config file
+2. Create `packs/cyber_webapp/cyber_webapp/mitre_techniques.yaml` 
+   containing command-to-technique-ID mappings 
+   (e.g. nmap to T1046, sqlmap to T1190)
+3. Update `ontology.py` to add a `technique_id` attribute to the 
    relevant node kinds
 4. Update `families/pentest.py` to call the classifier and tag 
    generated tasks with the appropriate technique ID
-5. Add unit tests in `packs/cyber_webapp/tests/` to verify 
-   correct tagging behavior
+5. Add unit tests in `packs/cyber_webapp/tests/` to verify correct 
+   tagging
 
 **Implement:** 
 https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
 
 **Review:** 
 Will self-review against `CONTRIBUTING.md` and ensure commit 
-messages follow the project's `feat:` prefix convention. Will 
-verify code style passes `ruff` linting before opening PR.
+messages follow the project's `feat:` prefix convention before 
+opening a PR.
 
 **Evaluate:** 
 Run `pytest packs/cyber_webapp/` to confirm new tests pass. 
-Manually verify a generated nmap task returns `technique_id: T1046`. 
-Confirm all 640 existing passing tests still pass.
-
+Manually verify that a generated nmap task returns `technique_id: 
+T1046`. Confirm all 640 existing passing tests still pass.
 ---
 
 ## Testing Strategy
