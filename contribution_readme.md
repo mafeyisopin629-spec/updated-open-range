@@ -67,11 +67,41 @@ Left a comment on the issue introducing myself and expressing intent to work on 
 2. [Step 2]
 3. [Observed result]
 
-### Reproduction Evidence
+## Reproduction Process
 
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+### Environment Setup
+Cloned the fork on Windows using Git and VS Code. Installed the `uv` 
+package manager via `pip install uv`. Ran `python -m uv sync` to 
+install all 23 project dependencies successfully. The only challenge 
+was that running `uv sync` directly failed with "command not found" 
+on Windows, which was resolved by using `python -m uv sync` instead. 
+Ran `python -m uv run pytest` to verify the environment and confirmed 
+640 tests passing. The 73 failures are pre-existing Windows-specific 
+issues related to `os.killpg` which is a Linux-only function and are 
+not related to this issue.
+
+### Steps to Reproduce
+1. Clone the fork and set up the environment using `python -m uv sync`
+2. Run `grep -r "technique_id" .` across the entire codebase
+3. Run `grep -r "MITRE" .` across the entire codebase
+4. Observed result: Both searches return zero results inside the 
+   actual source code, confirming that no MITRE ATT&CK technique 
+   tagging exists anywhere in the codebase. The only matches for 
+   "MITRE" were inside `contribution_readme.md` which is not part 
+   of the project source code.
+
+### Reproduction Evidence
+- **Commit showing reproduction:** 
+  https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
+- **Screenshots/logs:** 
+  `grep -r "technique_id" .` returned no results
+  `grep -r "MITRE" .` returned no results in source code
+- **My findings:** 
+  The `ontology.py` file defines structured attributes for cyber 
+  tasks but contains no `technique_id` field. The 
+  `families/pentest.py` file defines task families but has no 
+  MITRE ATT&CK mappings. The feature requested in issue 88 is 
+  completely absent from the codebase and ready to be implemented.
 
 ---
 
