@@ -12,11 +12,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
-from graphschema import WorldGraph
+from graphschema import Node, WorldGraph
 from openrange_pack_sdk import LLMRequest, PackError, Snapshot
 
-from cyber_webapp.realize_admit import classify_admission
-from cyber_webapp.reference_solver import _flag_record_key, _vuln_of_kind
+from cyber_webapp.codegen.handlers import _extract_handle_body
+from cyber_webapp.realize_admit import (
+    classify_admission_with_control,
+    classify_service_admission,
+)
+from cyber_webapp.reference_solver import (
+    _flag_record_key,
+    _vuln_of_kind,
+    control_request,
+)
 
 # The classes a prompt exists for. command_injection is the first realized class (#266);
 # sql_injection and path_traversal extend it across the response-leak and file-read
@@ -253,7 +261,8 @@ def _idor_prompt(param: str, flag_key: str, ctx: str, ref_prefix: str) -> str:
 def _broken_authz_prompt(
     header: str, expected: str, leak_field: str, ctx: str, params: Mapping[str, object]
 ) -> str:
-    pool = list(params.get("confirm_pool", []))
+    raw_pool = params.get("confirm_pool", [])
+    pool = list(raw_pool) if isinstance(raw_pool, list | tuple) else []
     confirm = str(params.get("confirm_param", "X-Confirm"))
     confirm_value = str(params.get("confirm_value", "1"))
     if ctx == "encoded_token":
@@ -431,18 +440,19 @@ def handler_from_result(parsed_json: Mapping[str, object] | None) -> str:
 def realize_world(
     snapshot: Snapshot,
     propose: Callable[[WorldGraph, str], str],
-    run_exploit: Callable[[str], tuple[str, str]],
+    run_probes: Callable[[str], tuple[str, str, str | None]],
 ) -> Snapshot:
     """Generate-verify-freeze: turn a procedural snapshot into an LLM-realized one.
 
-    For each realizable vuln: `propose` a handler, have the host `run_exploit` boot the
-    world and return the intended-exploit and benign response bodies, and keep the
-    handler only if the consequence verifier accepts it (leaks on the exploit, not on a
-    benign request) — otherwise fall back to the procedural template. The result is
-    re-frozen to a new content-addressed snapshot recording the realized kinds in
-    lineage. The host injects `propose` (the LLM) and `run_exploit` (booting an episode
-    is a host concern), so the pack stays transport-free. Mutates `snapshot.graph` — use
-    the returned snapshot.
+    For each realizable vuln: `propose` a handler, have the host `run_probes` boot the
+    world and return the (exploit, benign, control) response bodies, and keep the
+    handler only if the gate accepts it — the exploit leaks the flag, a benign request
+    does not, and the faithfulness control computes (so a faked/hard-coded handler is
+    rejected) — otherwise fall back to the procedural template. The result is re-frozen
+    to a new content-addressed snapshot recording the realized kinds in lineage. The
+    host injects `propose` (the LLM) and `run_probes` (booting an episode is a host
+    concern), so the pack stays transport-free. Mutates `snapshot.graph` — use the
+    returned snapshot.
     """
     graph = snapshot.graph
     realized: list[str] = []
@@ -457,8 +467,16 @@ def realize_world(
         if not handler.strip():
             continue
         vuln.attrs["realized_handler"] = handler
-        exploit_body, benign_body = run_exploit(kind)
-        if classify_admission(graph, exploit_body, benign_body).accepted:
+        exploit_body, benign_body, control_body = run_probes(kind)
+        control = control_request(graph, kind)
+        verdict = classify_admission_with_control(
+            graph,
+            exploit_body,
+            benign_body,
+            control_body,
+            control.expected if control else None,
+        )
+        if verdict.accepted:
             realized.append(kind)
         else:
             del vuln.attrs["realized_handler"]  # rejected — keep the template
@@ -468,5 +486,139 @@ def realize_world(
         graph=graph,
         tasks=snapshot.tasks,
         lineage={**dict(snapshot.lineage), "realized_handlers": tuple(realized)},
+        history=snapshot.history,
+    )
+
+
+_SERVICE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["endpoints"],
+    "properties": {
+        "endpoints": {"type": "object", "additionalProperties": {"type": "string"}}
+    },
+}
+
+
+def benign_endpoints_of(graph: WorldGraph, service_id: str) -> list[Node]:
+    """The service's endpoints with no affecting vuln — its realizable benign surface.
+
+    Empty if a vuln affects the whole service, or for the framework routes / and
+    /openapi.json (which the LLM must not author).
+    """
+    vuln_eps = {
+        e.dst
+        for v in graph.by_kind("vulnerability")
+        for e in graph.out_edges(v.id, "affects")
+    }
+    if service_id in vuln_eps:  # a service-level vuln owns every endpoint
+        return []
+    out: list[Node] = []
+    for edge in graph.out_edges(service_id, "exposes"):
+        ep = graph.nodes.get(edge.dst)
+        if ep is None or edge.dst in vuln_eps:
+            continue
+        if str(ep.attrs.get("path", "")) in ("/", "/openapi.json"):
+            continue
+        out.append(ep)
+    return out
+
+
+def service_realization_request(graph: WorldGraph, service_id: str) -> LLMRequest:
+    """The LLM request to author realistic bodies for a service's benign endpoints.
+
+    Procedural keeps the vuln, flag and routes; the LLM only fills the non-vuln
+    endpoints with plausible content. The host runs this and passes the result through
+    `realize_service_surface`'s whole-service admission.
+    """
+    service = graph.nodes[service_id]
+    kind = str(service.attrs.get("kind", "service"))
+    name = str(service.attrs.get("name", service_id))
+    paths = [str(ep.attrs.get("path")) for ep in benign_endpoints_of(graph, service_id)]
+    listing = "\n".join(f"  - {p}" for p in paths)
+    prompt = (
+        f"Author benign endpoint handlers for the {kind} service {name!r} of a "
+        "security-training web app.\n"
+        "For each path below, write a Python `def handle(query, state):` returning a "
+        "tuple (status:int, headers:dict, body:bytes) with realistic, plausible "
+        "content for that path — JSON for /api/* paths, simple HTML for pages.\n"
+        f"Paths:\n{listing}\n"
+        "- query is dict[str, list[str]]; stdlib only; import inside handle.\n"
+        "- These are BENIGN: do NOT read state['secrets'], the flag, or a data store "
+        "value column. Return only static or schema-shaped placeholders.\n"
+        'Return JSON: {"endpoints": {"<path>": "<the full def handle source>"}}.'
+    )
+    return LLMRequest(prompt=prompt, system=_SYSTEM, json_schema=_SERVICE_SCHEMA)
+
+
+def service_handlers_from_result(
+    parsed_json: Mapping[str, object] | None,
+) -> dict[str, str]:
+    """The {path: handler source} map out of an LLM result, dropping non-str entries."""
+    endpoints = (parsed_json or {}).get("endpoints")
+    if not isinstance(endpoints, Mapping):
+        return {}
+    return {
+        str(path): src
+        for path, src in endpoints.items()
+        if isinstance(src, str) and src.strip()
+    }
+
+
+def realize_service_surface(
+    snapshot: Snapshot,
+    service_id: str,
+    propose_service: Callable[[WorldGraph, str], Mapping[str, str]],
+    run_service_probes: Callable[[str], tuple[str, str, Mapping[str, str], bool]],
+) -> Snapshot:
+    """Generate-verify-freeze for a service's benign surface (DESIGN.md §9, #212).
+
+    The LLM (`propose_service`) authors the non-vuln endpoint bodies of `service_id`;
+    the host (`run_service_probes`) boots the realized world once and returns the
+    oracle exploit/benign bodies, a benign GET per realized endpoint, and whether `/`
+    still serves 200. Admit ALL-OR-NOTHING: keep the bodies only if the oracle still
+    fires, no benign endpoint leaks the flag, and the world boots — else fall back to
+    the procedural stubs. Re-freezes to a new snapshot recording the realized paths.
+    Mutates `snapshot.graph` — use the return.
+    """
+    graph = snapshot.graph
+    benign = {
+        str(ep.attrs.get("path")): ep for ep in benign_endpoints_of(graph, service_id)
+    }
+    applied: list[Node] = []
+    for path, src in propose_service(graph, service_id).items():
+        ep = benign.get(path)
+        if ep is None or not src.strip():
+            continue
+        try:
+            _extract_handle_body(src)  # must be valid Python with a def handle
+        except PackError:
+            continue
+        ep.attrs["realized_handler"] = src
+        applied.append(ep)
+
+    realized: tuple[str, ...] = ()
+    if applied:
+        exploit_body, benign_body, endpoint_bodies, root_ok = run_service_probes(
+            service_id
+        )
+        verdict = classify_service_admission(
+            graph,
+            oracle_exploit_body=exploit_body,
+            oracle_benign_body=benign_body,
+            benign_endpoint_bodies=endpoint_bodies,
+            root_ok=root_ok,
+        )
+        if verdict.accepted:
+            realized = tuple(str(ep.attrs.get("path")) for ep in applied)
+        else:
+            for ep in applied:
+                del ep.attrs["realized_handler"]
+    return Snapshot(
+        snapshot_id=graph.content_hash(),
+        ontology_id=snapshot.ontology_id,
+        graph=graph,
+        tasks=snapshot.tasks,
+        lineage={**dict(snapshot.lineage), "realized_endpoints": realized},
         history=snapshot.history,
     )
