@@ -454,4 +454,5 @@ __all__ = [
     "make_environment_factory",
     "make_reward_func",
     "reward_variance_policy",
+    "run_pool_curriculum",
 ]
