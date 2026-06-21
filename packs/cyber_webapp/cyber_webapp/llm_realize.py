@@ -24,6 +24,7 @@ from cyber_webapp.reference_solver import (
     _flag_record_key,
     _vuln_of_kind,
     control_request,
+    exploit_recipe,
 )
 
 # The classes a prompt exists for. command_injection is the first realized class (#266);
@@ -435,6 +436,52 @@ def handler_from_result(parsed_json: Mapping[str, object] | None) -> str:
     """The handler source out of an LLM result's parsed JSON, or '' if absent."""
     handler = (parsed_json or {}).get("handler")
     return handler if isinstance(handler, str) else ""
+
+
+_EXPLOIT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["exploit", "benign"],
+    "properties": {
+        "exploit": {"type": "string"},
+        "benign": {"type": "string"},
+    },
+}
+
+_EXPLOIT_RETURN = (
+    'Return JSON: {"exploit": "<value to send>", "benign": "<non-leaking value>"}.'
+)
+
+
+def exploit_request(graph: WorldGraph, kind: str) -> LLMRequest:
+    """The LLM request to author an (exploit, benign) pair for `kind`. The recipe
+    -- the technique plus the flag's LOCATION, never its value -- is read off the vuln's
+    meta if the world carries one (an LLM-built world supplies its own, #261), else
+    derived; so one generic prompt covers every kind."""
+    vuln = _vuln_of_kind(graph, kind)
+    endpoint_id = next(e.dst for e in graph.out_edges(vuln.id, "affects"))
+    endpoint = graph.nodes[endpoint_id]
+    where = f"{endpoint.attrs.get('method', 'GET')} {endpoint.attrs['public_url']}"
+    recipe = str(vuln.meta.get("exploit_recipe") or exploit_recipe(graph, kind))
+    return LLMRequest(
+        prompt=(
+            f"Target endpoint: {where}.\n{recipe}\n"
+            "Write the exploit value to send and a benign value that does not leak.\n"
+            + _EXPLOIT_RETURN
+        ),
+        system=_SYSTEM,
+        json_schema=_EXPLOIT_SCHEMA,
+    )
+
+
+def exploit_from_result(parsed_json: Mapping[str, object] | None) -> tuple[str, str]:
+    """The (exploit, benign) payloads from an LLM result's parsed JSON, or ('', '')."""
+    data = parsed_json or {}
+    exploit, benign = data.get("exploit"), data.get("benign")
+    return (
+        exploit if isinstance(exploit, str) else "",
+        benign if isinstance(benign, str) else "",
+    )
 
 
 def realize_world(
