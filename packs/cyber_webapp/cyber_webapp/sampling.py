@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import posixpath
 import random
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any
 
 from graphschema import Edge, Node, Role, Visibility, WorldGraph
@@ -146,21 +146,6 @@ _CORP_DOMAINS: tuple[str, ...] = (
 )
 _HOST_ENVS: tuple[str, ...] = ("prod", "stg", "infra")
 
-# Realistic people for the background accounts (DESIGN.md §2: `alice@corp.example`),
-# assigned deterministically and qualified with the world's corp domain.
-_PERSON_HANDLES: tuple[str, ...] = (
-    "alice.chen",
-    "brian.okafor",
-    "carla.diaz",
-    "devin.patel",
-    "erin.walsh",
-    "felix.nardi",
-    "grace.kim",
-    "hana.suzuki",
-    "ivan.petrov",
-    "julia.ross",
-)
-
 
 # Realistic service names by kind, sampled deterministically so a world reads like a
 # real company's estate rather than ``api1`` / ``db2`` (DESIGN.md §2: realism is
@@ -290,6 +275,22 @@ _RECON_PATHS: tuple[str, ...] = (
     "/.well-known/app-config",
 )
 
+
+def _is_networked(graph: WorldGraph) -> bool:
+    public_services = {
+        n.id for n in graph.by_kind("service") if n.attrs.get("exposure") == "public"
+    }
+    service_of_endpoint = {
+        e.dst: e.src for e in graph.edges.values() if e.kind == "exposes"
+    }
+    return any(
+        service_of_endpoint.get(edge.dst) in public_services
+        for vuln in graph.by_kind("vulnerability")
+        if vuln.attrs.get("kind") == "ssrf"
+        for edge in graph.out_edges(vuln.id, "affects")
+    )
+
+
 _COMMAND_INJECTION_BASE: tuple[str, ...] = (
     "ping",
     "nslookup",
@@ -318,7 +319,6 @@ _DEFAULT_COUNTS: Mapping[str, tuple[int, int]] = {
     "service_count": (2, 5),
     "endpoints_per_service": (1, 3),
     "vuln_count": (1, 3),
-    "account_count": (1, 3),
 }
 
 _DEFAULT_SERVICE_KIND_WEIGHTS: Mapping[str, int] = {
@@ -565,7 +565,7 @@ def sample_graph(
         attrs={"field": "value"},
     )
 
-    _sample_accounts(graph, rng, prior, corp_domain)
+    _burn_retired_account_rng(rng)
     _sample_vulnerabilities(
         graph,
         rng,
@@ -574,7 +574,7 @@ def sample_graph(
         oracle_shapes=_ORACLE_SHAPES_FOR_LOOT[loot_shape],
     )
     if _is_lateral(prior):
-        _lateralize(graph, rng)
+        _lateralize(graph, rng, prior)
     else:
         _networkize_ssrf(graph)
     if company and _recon_disclosure(prior) != "none":
@@ -731,6 +731,14 @@ def _sample_endpoints(
     return endpoints
 
 
+def _burn_retired_account_rng(rng: random.Random) -> None:
+    # Load-bearing despite the discarded draws: it replays the rng the retired NPC
+    # accounts once consumed, so dropping them left every world's id unchanged.
+    # Deleting this reshuffles the whole stream -- a deliberate reset, not a cleanup.
+    for _ in range(rng.randint(1, 3)):
+        _b62(rng, 16)
+
+
 def _public_url(service: Mapping[str, str], path: str) -> str:
     # Public-exposure services serve their endpoints at the root path;
     # anything else is reachable only at ``/svc/<name><path>``. The
@@ -738,43 +746,6 @@ def _public_url(service: Mapping[str, str], path: str) -> str:
     if service.get("exposure") == "public":
         return path
     return f"/svc/{service['name']}{path}"
-
-
-def _sample_accounts(
-    graph: WorldGraph,
-    rng: random.Random,
-    prior: PackPrior | None,
-    corp_domain: str,
-) -> None:
-    # Accounts are tagged ``Role.NPC``: they aren't the agent; they're background
-    # identities the realized world is seeded with. Names are real people at the
-    # company domain (deterministic, no rng draw) rather than admin / user1.
-    count = _sample_int(rng, prior, "account_count")
-    for i in range(count):
-        is_admin = i == 0
-        account_id = f"acct_{i}"
-        handle = _PERSON_HANDLES[i % len(_PERSON_HANDLES)]
-        graph.add_node(
-            Node(
-                id=account_id,
-                kind="account",
-                attrs={
-                    "username": f"{handle}@{corp_domain}",
-                    "role": "admin" if is_admin else "user",
-                    "active": True,
-                },
-                roles={Role.NPC},
-            )
-        )
-        credential_id = f"cred_{i}"
-        graph.add_node(
-            Node(
-                id=credential_id,
-                kind="credential",
-                attrs={"kind": "password", "value_ref": _b62(rng, 16)},
-            )
-        )
-        _add_edge(graph, "has_credential", account_id, credential_id)
 
 
 def _sample_vulnerabilities(
@@ -790,13 +761,8 @@ def _sample_vulnerabilities(
     # ``oracle_service_id``, so the flag is reachable by construction. The
     # rest are decoys drawn from the weighted pool.
     count = _sample_int(rng, prior, "vuln_count")
-    # Internal-only kinds (a metadata leak that serves the flag on a plain GET) are
-    # never placed by general sampling — on a reachable endpoint they leak the flag
-    # with no exploit. They enter a world only via ``_networkize_ssrf``, on an
-    # unreachable internal endpoint that an SSRF must pivot to.
-    pool = [
-        k for k in _weighted_pool(prior, "vuln_kinds") if k not in _INTERNAL_ONLY_KINDS
-    ]
+    vuln_pin = [str(k) for k in (prior.topology.get("vuln_pin") or [])]
+    pool = vuln_pin or _weighted_pool(prior, "vuln_kinds", exclude=_INTERNAL_ONLY_KINDS)
     if not pool:
         return
 
@@ -829,6 +795,15 @@ def _sample_vulnerabilities(
         rng, oracle_shapes, pool, oracle_endpoints, graph, db_backed_services
     )
 
+    pin_seq: list[str] | None = None
+    if vuln_pin:
+        rest = list(vuln_pin)
+        if oracle is not None and oracle[0] in rest:
+            rest.remove(oracle[0])
+            pin_seq = [oracle[0], *rest]
+        else:
+            pin_seq = list(vuln_pin)
+
     placed_pairs: set[tuple[str, str]] = set()
     placed_vulns: list[Node] = []
     bound_endpoints: set[str] = set()
@@ -837,7 +812,7 @@ def _sample_vulnerabilities(
         if i == 0 and oracle is not None:
             kind, target_node = oracle
         else:
-            kind = rng.choice(pool)
+            kind = pin_seq[i] if pin_seq is not None else rng.choice(pool)
             if kind not in VULN_CATALOG:
                 continue
             target_kinds = VULN_CATALOG[kind].target_kinds
@@ -1283,7 +1258,9 @@ def _flag_record_id(graph: WorldGraph) -> str | None:
     )
 
 
-def _lateralize(graph: WorldGraph, rng: random.Random) -> None:
+def _lateralize(
+    graph: WorldGraph, rng: random.Random, prior: PackPrior | None = None
+) -> None:
     # Compose a credential-reuse chain of sampled depth — the lateral-movement
     # primitive. Re-home the SSRF into PROXY mode (the agent drives the pivot), then
     # chain internal hosts: an entry host leaks a db credential, each next host is gated
@@ -1347,7 +1324,14 @@ def _lateralize(graph: WorldGraph, rng: random.Random) -> None:
     # (web -> api -> auth -> db) rather than hopping random hosts.
     tier = {"web": 1, "api": 2, "auth": 3, "db": 4}
     others.sort(key=lambda n: (tier.get(str(n.attrs.get("kind")), 2), n.id))
-    depth = rng.randint(1, min(_MAX_CHAIN_DEPTH, len(others)))
+    pinned_depth = prior.topology.get("chain_depth") if prior is not None else None
+    ceiling = min(_MAX_CHAIN_DEPTH, len(others))
+    if isinstance(pinned_depth, Mapping):
+        lo = max(1, min(int(pinned_depth["min"]), ceiling))
+        hi = max(lo, min(int(pinned_depth["max"]), ceiling))
+        depth = rng.randint(lo, hi)
+    else:
+        depth = rng.randint(1, ceiling)
     entry = others[0]
     gated_hosts = [*others[1:depth], graph.nodes[flag_service_id]]
     creds = [_b62(rng, 24) for _ in range(depth)]
@@ -1541,7 +1525,7 @@ def _weighted_pool(
     prior: PackPrior | None,
     key: str,
     *,
-    exclude: tuple[str, ...] = (),
+    exclude: Collection[str] = (),
 ) -> list[str]:
     weights = _prior_weights(prior, key)
     if weights is None:

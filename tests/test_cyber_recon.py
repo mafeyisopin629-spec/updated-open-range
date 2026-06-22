@@ -29,11 +29,11 @@ _COMPANY = {
     "runtime": {"tick": {"mode": "off"}},
     "npc": [],
     "seed": 3,
-    "company": True,
+    "topology": "company",
 }
-_NONE = {**_COMPANY, "recon_disclosure": "none"}
-_LATERAL_NONE = {**_COMPANY, "lateral_movement": True, "recon_disclosure": "none"}
-_DEFAULT = {k: v for k, v in _COMPANY.items() if k != "company"}
+_NONE = {**_COMPANY, "recon": "none"}
+_LATERAL_NONE = {**_COMPANY, "topology": "chain", "recon": "none"}
+_DEFAULT = {k: v for k, v in _COMPANY.items() if k != "topology"}
 
 
 def _admit(manifest: dict[str, object]) -> Snapshot:
@@ -89,7 +89,7 @@ def _services(graph: WorldGraph) -> list[dict[str, object]]:
 @pytest.mark.parametrize("level", ["full", "none"])
 @pytest.mark.parametrize("seed", [1, 2, 3, 5, 7])
 def test_every_recon_level_admits(level: str, seed: int) -> None:
-    _admit({**_COMPANY, "seed": seed, "recon_disclosure": level})
+    _admit({**_COMPANY, "seed": seed, "recon": level})
 
 
 @pytest.mark.parametrize("manifest", [_NONE, _LATERAL_NONE])
@@ -180,6 +180,50 @@ def test_evolution_does_not_re_add_recon_to_a_blind_world() -> None:
         if node.kind == "vulnerability"
     ]
     assert "config_disclosure" not in added
+
+
+def test_evolution_leaves_the_credential_chain_intact_but_still_deepens_it() -> None:
+    # Internal-only kinds (recon + the synthesized credential-reuse chain) must never
+    # be dropped, swapped, or added as a decoy -- only the append-hop may extend the
+    # chain. Without this, admission rejects the move after the fact, wasting budget.
+    internal_only = {
+        "config_disclosure",
+        "metadata_credential_leak",
+        "credential_leak",
+        "credential_gated_relay",
+        "credential_gated_flag",
+    }
+    chain_kinds = {"credential_leak", "credential_gated_relay", "credential_gated_flag"}
+    graph = _admit({**_COMPANY, "topology": "chain"}).graph
+    moves = available_mutations(graph, "webapp.pentest", [])
+
+    for move in moves:
+        if move.direction in ("soften", "diversify"):
+            assert not any(ck in move.note for ck in chain_kinds), move.note
+
+    appended = False
+    for move in moves:
+        if move.direction != "harden":
+            continue
+        if move.note.startswith("append a credential hop"):
+            appended = True
+            continue
+        for node in move.patch.nodes_added:
+            if node.kind == "vulnerability":
+                assert node.attrs.get("kind") not in internal_only, move.note
+    assert appended  # the legitimate chain-deepening frontier move is still offered
+
+
+def test_evolution_keeps_the_networked_foothold() -> None:
+    # In a networked world the SSRF is the only public entry; soften/diversify must
+    # neither remove it nor swap it away (that strips the foothold -> unsolvable, which
+    # admission rejects), but the world must still be evolvable by other moves.
+    graph = _admit(_COMPANY).graph
+    moves = available_mutations(graph, "webapp.pentest", [])
+    for move in moves:
+        if move.direction in ("soften", "diversify"):
+            assert "ssrf" not in move.note, move.note  # the foothold is protected
+    assert any(m.direction in ("soften", "diversify") for m in moves)  # not frozen
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3, 5, 7])

@@ -15,9 +15,10 @@ Covers:
 
 from __future__ import annotations
 
+import pytest
 from cyber_webapp import WebappBuilder, WebappPack
 from cyber_webapp.priors import default_prior
-from openrange_pack_sdk import BuildResult, PackPrior, Snapshot
+from openrange_pack_sdk import BuildResult, PackError, PackPrior, Snapshot
 
 from openrange.core.admit import admit
 
@@ -40,10 +41,10 @@ def test_builder_graph_carries_expected_kinds() -> None:
     """A seeded build emits every node kind a fully-shaped webapp needs.
 
     The sampler always lays down at least one of each core kind so the
-    invariants pass and both families can bind tasks. The set we assert
-    on is the intersection of "always present" kinds across the
-    sampler — ``account`` / ``credential`` are sampled in batches >= 1,
-    ``network`` is single-instance, etc.
+    invariants pass and both families can bind tasks. ``network`` is
+    single-instance, etc. ``credential`` is chain-only (the synthesized
+    credential-reuse chain), so a plain world has none — it is exercised
+    in the lateral-movement tests instead.
     """
     builder = WebappBuilder(default_prior())
     result = builder.build({"seed": 0})
@@ -56,8 +57,6 @@ def test_builder_graph_carries_expected_kinds() -> None:
         "record",
         "secret",
         "vulnerability",
-        "account",
-        "credential",
         "network",
     }
     missing = expected - kinds
@@ -245,16 +244,13 @@ def test_absent_scale_is_a_noop() -> None:
     assert plain == empty
 
 
-def test_scale_ignores_non_mapping_entries() -> None:
-    """A non-mapping ``scale`` value is skipped, not crashed on — the
-    world falls back to the default range for that key."""
-    plain = WebappBuilder(default_prior()).build({"seed": 7}).graph.content_hash()
-    junk = (
-        WebappBuilder(default_prior())
-        .build({"seed": 7, "scale": {"service_count": "lots"}})
-        .graph.content_hash()
-    )
-    assert plain == junk
+def test_a_malformed_scale_entry_is_rejected() -> None:
+    """A non-mapping ``scale`` value is a manifest error, not a constraint
+    silently dropped back to auto — the control surface fails loud."""
+    with pytest.raises(PackError):
+        WebappBuilder(default_prior()).build(
+            {"seed": 7, "scale": {"service_count": "lots"}}
+        )
 
 
 def test_scaled_world_still_admits() -> None:

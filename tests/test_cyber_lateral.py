@@ -31,7 +31,7 @@ def _manifest(seed: int = 3) -> dict[str, object]:
         "runtime": {"tick": {"mode": "off"}},
         "npc": [],
         "seed": seed,
-        "lateral_movement": True,
+        "topology": "chain",
     }
 
 
@@ -86,6 +86,58 @@ def test_admission_rejects_a_broken_credential_binding() -> None:
     del graph.edges[produces[0].id]
     issues = validate(graph, pack.ontology(), pack.invariants())
     assert any(i.code == "credential_binding" and i.severity == "error" for i in issues)
+
+
+def test_admission_rejects_a_drifted_credential_value() -> None:
+    # The credential node is the single source of truth: if a gate's param-string
+    # token drifts from the node's value_ref, admission rejects it even though the
+    # structural binding is still intact.
+    import dataclasses
+
+    from cyber_webapp.invariants import credential_value_binding
+    from graphschema import validate
+
+    pack = WebappPack()
+    graph = _admit().graph
+    assert not credential_value_binding(graph)  # a fresh world is value-consistent
+
+    gate = next(
+        n
+        for n in graph.by_kind("vulnerability")
+        if n.attrs.get("kind") in ("credential_gated_relay", "credential_gated_flag")
+    )
+    drifted = {**gate.attrs, "params": {**gate.attrs["params"], "credential": "WRONG"}}
+    graph.nodes[gate.id] = dataclasses.replace(gate, attrs=drifted)
+
+    assert any(i.code == "credential_value" for i in credential_value_binding(graph))
+    issues = validate(graph, pack.ontology(), pack.invariants())
+    assert any(i.code == "credential_value" and i.severity == "error" for i in issues)
+
+
+def test_admission_rejects_a_short_circuitable_chain() -> None:
+    # The flag must live only in the gated HIDDEN secret; planting the real value in a
+    # reachable node (here the loot record) would let one response-leak skip the chain.
+    import dataclasses
+
+    from cyber_webapp.invariants import flag_confined_to_gate
+    from graphschema import validate
+
+    pack = WebappPack()
+    graph = _admit().graph
+    assert not flag_confined_to_gate(graph)  # a fresh chain confines the flag
+
+    flag = str(graph.nodes["secret_flag"].attrs["value_ref"])
+    record = next(
+        graph.nodes[e.src]
+        for e in graph.edges.values()
+        if e.kind == "holds" and e.dst == "secret_flag"
+    )
+    leaky = {**record.attrs, "fields": {**record.attrs["fields"], "value": flag}}
+    graph.nodes[record.id] = dataclasses.replace(record, attrs=leaky)
+
+    assert any(i.code == "flag_short_circuit" for i in flag_confined_to_gate(graph))
+    issues = validate(graph, pack.ontology(), pack.invariants())
+    assert any(i.code == "flag_short_circuit" and i.severity == "error" for i in issues)
 
 
 def test_chain_credentials_are_not_guarded() -> None:

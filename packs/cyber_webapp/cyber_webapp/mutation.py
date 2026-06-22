@@ -9,6 +9,7 @@ from graphschema import Edge, GraphPatch, Node, Visibility, WorldGraph
 from openrange_pack_sdk import EpisodeReportLike, Mutation, Snapshot
 
 from cyber_webapp.ontology import ONTOLOGY_ID
+from cyber_webapp.sampling import _INTERNAL_ONLY_KINDS, _is_networked
 from cyber_webapp.vulnerabilities import CATALOG as VULN_CATALOG
 
 # Keep the import alive even though only the validator reads ONTOLOGY_ID.
@@ -32,9 +33,13 @@ _APPEND_HOP_RELEVANCE = 0.9
 
 _GATE_PATH = "/internal/vault"
 _TOKEN_PARAMS: tuple[str, ...] = ("token", "api_key", "auth", "session", "key")
-# Structural recon owned by the recon_disclosure knob (graph-derived params):
-# evolution must neither drop it (soften/diversify) nor add a generic one (harden).
-_RECON_KIND = "config_disclosure"
+_FOOTHOLD_KIND = "ssrf"
+
+
+def _protected_kinds(graph: WorldGraph) -> frozenset[str]:
+    if _is_networked(graph):
+        return _INTERNAL_ONLY_KINDS | {_FOOTHOLD_KIND}
+    return _INTERNAL_ONLY_KINDS
 
 
 def coerce_string_list(value: object) -> list[str]:
@@ -65,8 +70,9 @@ def available_mutations(
         _harden_add_absent_mutations(graph, family_id, vulns_by_kind),
     )
 
+    protected = _protected_kinds(graph)
     for kind, node_ids in vulns_by_kind.items():
-        if kind == _RECON_KIND:
+        if kind in protected:
             continue
         score = _exploitation_score(node_ids, paths_per_vuln, path_hits)
         relevance = max(score, _REMOVE_RELEVANCE_FLOOR)
@@ -115,7 +121,7 @@ def _harden_add_absent_mutations(
 
     mutations: list[Mutation] = []
     for kind in sorted(VULN_CATALOG):
-        if kind in vulns_by_kind or kind == _RECON_KIND:
+        if kind in vulns_by_kind or kind in _INTERNAL_ONLY_KINDS:
             continue
         catalog_entry = VULN_CATALOG[kind]
         target_kinds = catalog_entry.target_kinds
@@ -207,10 +213,12 @@ def _diversify_swap_kind_mutations(
     # In-place update — affects edge keeps its id since src/kind/dst are unchanged.
     if not vulns_by_kind:
         return []
+    networked = _is_networked(graph)
+    protected = _protected_kinds(graph)
     existing_kinds_by_target = _existing_kinds_by_target(graph)
     mutations: list[Mutation] = []
     for kind in sorted(vulns_by_kind):
-        if kind == _RECON_KIND:
+        if kind in protected:
             continue
         node_ids = sorted(vulns_by_kind[kind])
         if not node_ids:
@@ -231,6 +239,8 @@ def _diversify_swap_kind_mutations(
         )
         if alt_kind is None:
             continue
+        if networked and alt_kind == _FOOTHOLD_KIND:
+            continue  # never introduce a second public foothold into a networked world
         alt_entry = VULN_CATALOG[alt_kind]
         updated_node = Node(
             id=vuln_node.id,
@@ -606,7 +616,7 @@ def _pick_alt_kind(
 ) -> str | None:
     target_node_kind = target.kind
     for alt in sorted(VULN_CATALOG):
-        if alt == current_kind:
+        if alt == current_kind or alt in _INTERNAL_ONLY_KINDS:
             continue
         if (alt, target.id) in existing_kinds_by_target:
             continue

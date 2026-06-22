@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from graphschema import Issue, WorldGraph
 
 _ORPHAN_EXEMPT: frozenset[str] = frozenset({"host", "network"})
@@ -175,9 +177,9 @@ def credential_reuse_binding(graph: WorldGraph) -> list[Issue]:
     one strictly-earlier hop on the `enables` chain, and the producing and
     gating vulns must keep their credential-chain kinds.
 
-    Binds by credential-node identity + enable ordering; it does not read
-    `value_ref` or detect cycles (the chain is a DAG by construction), and the
-    handler param-name / response-shape contract stays the verifier's job. The
+    Binds by credential-node identity + enable ordering; value-consistency is
+    `credential_value_binding`'s job and cycle-freedom holds by DAG construction,
+    while the handler param-name / response-shape contract stays the verifier's. The
     kind check is what stops a mutation that rewrites a chain vuln in place from
     leaving the binding structurally intact but the world unsolvable. Endpoints
     without a `requires_credential` edge are untouched.
@@ -268,6 +270,107 @@ def credential_reuse_binding(graph: WorldGraph) -> list[Issue]:
                     )
                 )
     return issues
+
+
+def credential_value_binding(graph: WorldGraph) -> list[Issue]:
+    """The credential node is the single source of truth for its token value: the
+    producing hop emits exactly the node's ``value_ref`` and the gating hop validates
+    against exactly that same value. This catches drift between the node and the
+    handler param-string copies -- a mutation or hand-edit that changes one but not
+    the other, leaving the chain structurally bound yet unsolvable. The reference
+    solver stays response-driven; this is the admission backstop that lets the graph
+    node be authoritative.
+    """
+    cred_value = {
+        n.id: str(n.attrs.get("value_ref", "")) for n in graph.by_kind("credential")
+    }
+    vuln = {n.id: n for n in graph.by_kind("vulnerability")}
+    affects: dict[str, list[str]] = {}
+    for edge in graph.edges.values():
+        if edge.kind == "affects":
+            affects.setdefault(edge.dst, []).append(edge.src)
+
+    def _param(vuln_id: str, key: str) -> str | None:
+        node = vuln.get(vuln_id)
+        params = node.attrs.get("params") if node is not None else None
+        if not isinstance(params, Mapping):
+            return None
+        value = params.get(key)
+        return None if value is None else str(value)
+
+    issues: list[Issue] = []
+    for edge in graph.edges.values():
+        if edge.kind == "produces":
+            kind = str(vuln[edge.src].attrs.get("kind", "")) if edge.src in vuln else ""
+            relay = kind == "credential_gated_relay"
+            emitted = _param(edge.src, "next_credential" if relay else "credential")
+            if emitted is not None and emitted != cred_value.get(edge.dst):
+                issues.append(
+                    Issue(
+                        "error",
+                        "credential_value",
+                        f"producer {edge.src!r} emits a token that does not match "
+                        f"credential node {edge.dst!r}'s value_ref",
+                        edge.src,
+                    )
+                )
+        elif edge.kind == "requires_credential":
+            expected = cred_value.get(edge.dst)
+            for gate in affects.get(edge.src, []):
+                if str(vuln[gate].attrs.get("kind", "")) not in _CHAIN_GATE_KINDS:
+                    continue
+                got = _param(gate, "credential")
+                if got is not None and got != expected:
+                    issues.append(
+                        Issue(
+                            "error",
+                            "credential_value",
+                            f"gate {gate!r} validates a token that does not match "
+                            f"credential node {edge.dst!r}'s value_ref",
+                            gate,
+                        )
+                    )
+    return issues
+
+
+def _contains_value(obj: object, needle: str) -> bool:
+    if isinstance(obj, str):
+        return needle in obj
+    if isinstance(obj, Mapping):
+        return any(_contains_value(v, needle) for v in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return any(_contains_value(v, needle) for v in obj)
+    return False
+
+
+def flag_confined_to_gate(graph: WorldGraph) -> list[Issue]:
+    """In a credential-reuse chain the flag is served only by the terminal gate out of
+    the HIDDEN ``secret_flag``, so the real value must appear nowhere else: the loot
+    record holds a decoy and no PUBLIC node or vuln param carries it. Otherwise a single
+    response-leak on an earlier hop would short-circuit the whole chain. Chain-only --
+    a single-service world legitimately keeps the flag in its loot record.
+    """
+    if not any(
+        v.attrs.get("kind") == "credential_gated_flag"
+        for v in graph.by_kind("vulnerability")
+    ):
+        return []
+    if "secret_flag" not in graph.nodes:
+        return []  # presence is secret_must_be_held's job
+    flag = str(graph.nodes["secret_flag"].attrs.get("value_ref", ""))
+    if not flag:
+        return []
+    return [
+        Issue(
+            "error",
+            "flag_short_circuit",
+            f"node {nid!r} ({node.kind}) exposes the real flag value outside the "
+            f"gated secret -- the chain could be short-circuited",
+            nid,
+        )
+        for nid, node in graph.nodes.items()
+        if nid != "secret_flag" and _contains_value(node.attrs, flag)
+    ]
 
 
 def sqli_targets_db_backed_service(graph: WorldGraph) -> list[Issue]:

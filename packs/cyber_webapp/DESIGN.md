@@ -367,6 +367,16 @@ the flag leaks via `consequence.detect_leak`, confirm a benign request does *not
 structural admission is a graph-path check; an LLM realization needs *dynamic* admission,
 because the code might be wrong.)
 
+**The manifest's entry to this ladder is the `generate` knob** (`MANIFEST.md`):
+`false` keeps a world purely procedural; `"vuln"` / `"service"` / `"world"` route the
+frozen procedural snapshot through *generate → verify → freeze* at the rung above. Its
+terminus is a *novel class* — the LLM proposes a vulnerability the catalog does not have
+and emits its exploit recipe (#317's recipe-on-graph), and the **same kind-agnostic**
+consequence gate (it keys only on "a HIDDEN value leaked," §8.3) admits it
+([#261](https://github.com/vecna-labs/open-range/issues/261)). That is the open end of the
+auto↔specific control surface: every other knob constrains *within* the catalog;
+`generate` is the only one that leaves "what kind" to the LLM, still behind the verifier.
+
 ### The container backing
 
 The `CONTAINER` backing runs the one generated app (not a bespoke app per class). It sets
@@ -457,6 +467,23 @@ The flag is reachable ONLY through the final gate: the db record's value is a de
 flag lives in the gated secret. That composable hop is the action a search-based sampler
 ([#193](https://github.com/vecna-labs/open-range/issues/193)) composes and scores — the
 substrate for "synthesize, don't hand-shape."
+
+**Every chain is guarded, not just generated** (§8 — the verifier is the ceiling). Three
+admission invariants keep a synthesized chain a genuine multi-hop puzzle:
+`credential_reuse_binding` checks the structure (each gate's credential comes from exactly
+one strictly-earlier hop); `credential_value_binding` makes the credential *node* the single
+source of truth for its token, rejecting any drift between the node and the handler's param
+copy; and `flag_confined_to_gate` rejects any world where the real flag is reachable outside
+the terminal gate, so a single response-leak can never short-circuit the chain. The chain is
+**memorization-proof** by construction — the agent loots each token live from the hop before —
+and `reseed_chain` re-rolls the flag and every token together (kept value-consistent) to
+prove it: a genuine breach recovers the fresh flag, a memorized one fails. Curriculum
+evolution can **deepen** a chain (append a hop) but never strip it — the internal-only chain
+kinds and the public SSRF foothold are excluded from soften/diversify, so no move drops the
+recon, the foothold, or a hop. A believability sweep drives the reference walk over the
+sampled depth spread to confirm every chain is reachable, solvable, benign-safe, and
+un-short-circuitable, and each admitted world records its solve-path-cost difficulty
+([#322](https://github.com/vecna-labs/open-range/issues/322)) on its lineage.
 
 Correctness is as in §2–§3: procedural owns topology, flag placement, and the
 solvable-by-construction chain; feasibility proves reachability across services
