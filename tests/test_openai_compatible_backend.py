@@ -270,3 +270,44 @@ def test_litellm_backend_completes_via_an_openai_compatible_server() -> None:
 def test_litellm_backend_requires_a_model() -> None:
     with pytest.raises(LLMBackendError, match="requires a model"):
         OR.LiteLLMBackend(model="  ").preflight()
+
+
+def test_openai_compatible_backend_passes_sampling_and_vendor_extras() -> None:
+    def handler(
+        _payload: Mapping[str, object],
+        _headers: Mapping[str, str],
+        _path: str,
+    ) -> ServerResponse:
+        return 200, {"choices": [{"message": {"content": "ok"}}]}, 0
+
+    with running_openai_server(handler) as (base_url, requests):
+        OR.OpenAICompatibleBackend(
+            base_url=f"{base_url}/v1",
+            model="demo-model",
+            temperature=0.3,
+            max_tokens=64,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        ).complete(LLMRequest("hi"))
+
+    payload = cast(dict[str, Any], requests[0]["payload"])
+    assert payload["temperature"] == 0.3
+    assert payload["max_tokens"] == 64
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_openai_compatible_backend_omits_sampling_knobs_by_default() -> None:
+    def handler(
+        _payload: Mapping[str, object],
+        _headers: Mapping[str, str],
+        _path: str,
+    ) -> ServerResponse:
+        return 200, {"choices": [{"message": {"content": "ok"}}]}, 0
+
+    with running_openai_server(handler) as (base_url, requests):
+        OR.OpenAICompatibleBackend(
+            base_url=f"{base_url}/v1", model="demo-model"
+        ).complete(LLMRequest("hi"))
+
+    payload = cast(dict[str, Any], requests[0]["payload"])
+    assert "temperature" not in payload
+    assert "max_tokens" not in payload

@@ -243,6 +243,11 @@ class OpenAICompatibleBackend:
     can override the default ``Authorization`` bearer for providers using a different
     auth scheme. The default ``model`` suits OpenAI's API; set it explicitly for local
     and third-party servers.
+
+    For reasoning models, set ``max_tokens`` to bound the reply (otherwise the
+    chain-of-thought can run to the context limit) and ``extra_body`` to pass vendor
+    extensions straight through — e.g. ``{"chat_template_kwargs": {"enable_thinking":
+    False}}`` turns thinking off entirely (some models ignore the ``/no_think`` token).
     """
 
     base_url: str = "https://api.openai.com/v1"
@@ -250,7 +255,10 @@ class OpenAICompatibleBackend:
     api_key: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     timeout: float = 120.0
+    temperature: float | None = None
+    max_tokens: int | None = None
     extra_headers: Mapping[str, str] | None = None
+    extra_body: Mapping[str, object] | None = None
     json_schema_strict: bool = False
 
     def preflight(self) -> None:
@@ -331,6 +339,12 @@ class OpenAICompatibleBackend:
                     "schema": request.json_schema,
                 },
             }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if self.extra_body is not None:
+            payload.update(self.extra_body)
         return payload
 
 
