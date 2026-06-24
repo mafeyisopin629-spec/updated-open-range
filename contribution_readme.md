@@ -3,7 +3,7 @@
 **Contribution Number:** [1]  
 **Student:** [Mafeyisopin Ayeni]  
 **Issue:** [https://github.com/vecna-labs/open-range/issues/88]  
-**Status:** Phase II Complete
+**Status:** Phase III Complete
 
 ---
 
@@ -162,36 +162,48 @@ T1046`. Confirm all 640 existing passing tests still pass.
 
 ### Unit Tests
 
-- [ ] Test case 1: [Description]
-- [ ] Test case 2: [Description]
-- [ ] Test case 3: [Description]
+- [x] Test case 1: nmap command correctly returns T1046 (Network Service Discovery)
+- [x] Test case 2: sqlmap command correctly returns T1190 (Exploit Public-Facing Application)
+- [x] Test case 3: ssh command correctly returns T1078 (Valid Accounts)
+- [x] Test case 4: unknown command correctly returns None when no match found
+- [x] Test case 5: hydra command correctly returns T1110 (Brute Force)
 
 ### Integration Tests
 
-- [ ] Integration scenario 1
-- [ ] Integration scenario 2
+- [x] Integration scenario 1: classify_technique reads mitre_techniques.yaml successfully
+- [x] Integration scenario 2: full test suite of 640 existing tests still pass with no regressions
 
 ### Manual Testing
 
-[What you tested manually and results]
+Ran `python -m uv run pytest packs/cyber_webapp/tests/test_technique_classifier.py -v`
+in the local Windows environment. All 5 tests passed in 0.48s. Also ran the full
+project test suite confirming no regressions were introduced by the new files.
 
 ---
 
 ## Implementation Notes
 
-### Week [X] Progress
+### Week 3 Progress
+**What I built:**
+- Created `mitre_techniques.yaml` mapping 5 MITRE ATT&CK techniques
+  to command keywords (T1046, T1190, T1059, T1078, T1110)
+- Created `technique_classifier.py` with two functions:
+  `load_techniques()` and `classify_technique()`
+- Updated `ontology.py` to add `technique_id` attribute to
+  vulnerability node kind
+- Updated `families/pentest.py` to import and call the classifier
+- Created `tests/test_technique_classifier.py` with 5 passing tests
 
-[What you built this week, challenges faced, decisions made]
+**Challenges faced:**
+- `uv` command not found on Windows, resolved using `python -m uv`
+- hydra keyword conflict between T1078 and T1110, resolved by
+  removing hydra from T1078 keywords in the YAML file
 
-### Week [Y] Progress
-
-[Continue documenting as you work]
-
-### Code Changes
-
-- **Files modified:** [List]
-- **Key commits:** [Links to important commits]
-- **Approach decisions:** [Why you chose certain approaches]
+**Code Changes:**
+- **Files modified:** `ontology.py`, `families/pentest.py`
+- **Files created:** `technique_classifier.py`, `mitre_techniques.yaml`,
+  `tests/test_technique_classifier.py`
+- **Branch:** https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
 
 ---
 
