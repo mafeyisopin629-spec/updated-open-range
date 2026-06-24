@@ -3,7 +3,7 @@
 **Contribution Number:** [1]  
 **Student:** [Mafeyisopin Ayeni]  
 **Issue:** [https://github.com/vecna-labs/open-range/issues/88]  
-**Status:** Phase I Complete
+**Status:** Phase II Complete
 
 ---
 
@@ -58,51 +58,103 @@ Left a comment on the issue introducing myself and expressing intent to work on 
 ## Reproduction Process
 
 ### Environment Setup
-
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+Cloned the fork on Windows using Git and VS Code. Installed the `uv` 
+package manager via `pip install uv`. Ran `python -m uv sync` to 
+install all 23 project dependencies successfully. The only challenge 
+was that running `uv sync` directly failed with "command not found" 
+on Windows, which was resolved by using `python -m uv sync` instead. 
+Ran `python -m uv run pytest` to verify the environment and confirmed 
+640 tests passing. The 73 failures are pre-existing Windows-specific 
+issues related to `os.killpg` which is a Linux-only function and are 
+not related to this issue.
 
 ### Steps to Reproduce
-
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. Clone the fork and set up the environment using `python -m uv sync`
+2. Run `grep -r "technique_id" .` across the entire codebase
+3. Run `grep -r "MITRE" .` across the entire codebase
+4. Observed result: Both searches return zero results inside the 
+   actual source code, confirming that no MITRE ATT&CK technique 
+   tagging exists anywhere in the codebase. The only matches for 
+   "MITRE" were inside `contribution_readme.md` which is not part 
+   of the project source code.
 
 ### Reproduction Evidence
-
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
+- **Commit showing reproduction:** 
+  https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
+- **Screenshots/logs:** 
+  `grep -r "technique_id" .` returned no results
+  `grep -r "MITRE" .` returned no results in source code
+- **My findings:** 
+  The `ontology.py` file defines structured attributes for cyber 
+  tasks but contains no `technique_id` field. The 
+  `families/pentest.py` file defines task families but has no 
+  MITRE ATT&CK mappings. The feature requested in issue 88 is 
+  completely absent from the codebase and ready to be implemented.
 
 ---
 
 ## Solution Approach
 
 ### Analysis
-
-[Your analysis of the root cause - what's causing the issue?]
+The cyber task data structures in 
+`packs/cyber_webapp/cyber_webapp/ontology.py` and the task 
+definitions in `packs/cyber_webapp/cyber_webapp/families/pentest.py` 
+have no `technique_id` field. There is no classifier anywhere in the 
+codebase that maps commands to MITRE ATT&CK technique IDs. Running 
+`grep -r "technique_id"` returns zero results across the entire 
+codebase, confirming the feature is completely missing.
 
 ### Proposed Solution
-
-[High-level description of your fix approach]
+Build a Python classifier that reads a YAML config file containing 
+command-to-technique mappings and automatically tags generated cyber 
+tasks with the correct MITRE ATT&CK technique ID. Update the ontology 
+to include a `technique_id` attribute and wire the classifier into the 
+task generation pipeline.
 
 ### Implementation Plan
-
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** 
+When the AI agent generates cyber tasks (e.g. running "nmap" or 
+"sqlmap"), those tasks are stored as plain strings with no security 
+taxonomy attached. The MITRE ATT&CK framework provides standardized 
+technique IDs (e.g. T1046 for network scanning) that would make 
+these tasks comparable to industry benchmarks. The feature is 
+completely absent from the codebase.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:** 
+The `ontology.py` file already defines structured attributes for 
+cyber tasks using `AttrSpec` and `AttrType`. This is the same 
+pattern we will follow to add a `technique_id` field. The 
+`families/pentest.py` file is where individual task families are 
+defined and is where MITRE mappings will be added.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:**
+1. Create `packs/cyber_webapp/cyber_webapp/technique_classifier.py` 
+   as a new Python classifier that maps command patterns to MITRE 
+   ATT&CK technique IDs using a YAML config file
+2. Create `packs/cyber_webapp/cyber_webapp/mitre_techniques.yaml` 
+   containing command-to-technique-ID mappings 
+   (e.g. nmap to T1046, sqlmap to T1190)
+3. Update `ontology.py` to add a `technique_id` attribute to the 
+   relevant node kinds
+4. Update `families/pentest.py` to call the classifier and tag 
+   generated tasks with the appropriate technique ID
+5. Add unit tests in `packs/cyber_webapp/tests/` to verify correct 
+   tagging
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** 
+https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** 
+Will self-review against `CONTRIBUTING.md` and ensure commit 
+messages follow the project's `feat:` prefix convention before 
+opening a PR.
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** 
+Run `pytest packs/cyber_webapp/` to confirm new tests pass. 
+Manually verify that a generated nmap task returns `technique_id: 
+T1046`. Confirm all 640 existing passing tests still pass.
 
 ---
 
