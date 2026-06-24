@@ -28,7 +28,6 @@ techniques:
       - ssh
       - login
       - credential
-      - hydra
 
   T1110:
     name: Brute Force
