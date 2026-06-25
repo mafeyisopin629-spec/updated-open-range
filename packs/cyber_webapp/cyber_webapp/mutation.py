@@ -20,6 +20,8 @@ from cyber_webapp.vulnerabilities import BODY_SHAPED_KINDS
 from cyber_webapp.vulnerabilities import CATALOG as VULN_CATALOG
 
 _REMOVE_RELEVANCE_FLOOR = 0.05
+# Above _REMOVE_RELEVANCE_FLOOR so a chain soften outranks decoy-removal.
+_HOP_SOFTEN_FLOOR = 0.5
 
 _ADD_ABSENT_RELEVANCE = 0.5
 
@@ -83,19 +85,11 @@ def available_mutations(
             ),
         )
 
-    # Rescues an agent stuck ON the chain, which decoy-removal can't. Relevance is the
-    # agent's whole-chain engagement, so it outranks decoy-removal only when the chain
-    # is the focus.
-    chain_vuln_ids = [
-        v.id
-        for v in graph.by_kind("vulnerability")
-        if str(v.attrs.get("kind", "")).startswith("credential")
-    ]
-    hop_soften = _soften_remove_hop_mutation(
-        graph,
-        family_id,
-        _exploitation_score(chain_vuln_ids, paths_per_vuln, path_hits),
-    )
+    # Internal chain hops are proxied server-side and never reach requests_made, so the
+    # public SSRF foothold is the only observable signal the agent is on the chain.
+    engagement = _chain_engagement_score(graph, path_hits)
+    hop_relevance = max(engagement, _HOP_SOFTEN_FLOOR) if engagement > 0.0 else 0.0
+    hop_soften = _soften_remove_hop_mutation(graph, family_id, hop_relevance)
     if hop_soften is not None:
         options.append(hop_soften)
 
@@ -702,6 +696,34 @@ def _exploitation_score(
     hits = sum(path_hits.get(p, 0) for p in affected)
     total = sum(path_hits.values())
     return min(1.0, hits / max(1, total))
+
+
+def _public_foothold_paths(graph: WorldGraph) -> set[str]:
+    # requests_made logs the endpoint's public_url, not its path attr -- match on that.
+    urls: set[str] = set()
+    for vuln in graph.by_kind("vulnerability"):
+        if str(vuln.attrs.get("kind", "")) != "ssrf":
+            continue
+        for edge in graph.out_edges(vuln.id, "affects"):
+            endpoint = graph.nodes.get(edge.dst)
+            if endpoint is None or endpoint.kind != "endpoint":
+                continue
+            service = _service_of_endpoint(graph, endpoint.id)
+            if service is not None and service.attrs.get("exposure") == "public":
+                url = str(endpoint.attrs.get("public_url", ""))
+                if url:
+                    urls.add(url)
+    return urls
+
+
+def _chain_engagement_score(graph: WorldGraph, path_hits: Mapping[str, int]) -> float:
+    foothold = _public_foothold_paths(graph)
+    if not foothold or not path_hits:
+        return 0.0
+    hits = sum(
+        count for path, count in path_hits.items() if path.split("?", 1)[0] in foothold
+    )
+    return min(1.0, hits / max(1, sum(path_hits.values())))
 
 
 def _fresh_vuln_id(kind: str, existing_ids: set[str]) -> str:

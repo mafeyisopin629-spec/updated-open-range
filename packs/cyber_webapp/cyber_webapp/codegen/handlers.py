@@ -151,22 +151,32 @@ def _default_handler_body(service_name: str, path: str, kind: str) -> str:
             "json.dumps(payload).encode()\n"
         )
     elif kind == "db":
+        # A sibling route shares this table; the benign default must not serve a
+        # guarded (HIDDEN) value here — only the vuln's bypass may.
         body = (
             'schema = state["schema"]\n'
             'table = schema["table"]\n'
             'key_col = schema["key_column"]\n'
             'value_col = schema["value_column"]\n'
+            'guarded = set(state.get("guarded", {}).values())\n'
             'requested = (query.get("key", [""]) or [""])[0]\n'
             'cursor = state["db"].cursor()\n'
             "if requested:\n"
             '    sql = f"SELECT {key_col}, {value_col} FROM {table} WHERE '
             '{key_col} = ?"\n'
             "    rows = [\n"
-            "        dict(r) for r in cursor.execute(sql, (requested,)).fetchall()\n"
+            "        d for d in (dict(r) for r in "
+            "cursor.execute(sql, (requested,)).fetchall())\n"
+            "        if str(d.get(value_col, '')) not in guarded\n"
             "    ]\n"
             "else:\n"
-            '    sql = f"SELECT {key_col} FROM {table} ORDER BY {key_col}"\n'
-            "    rows = [{key_col: r[0]} for r in cursor.execute(sql).fetchall()]\n"
+            '    sql = f"SELECT {key_col}, {value_col} FROM {table} '
+            'ORDER BY {key_col}"\n'
+            "    rows = [\n"
+            "        {key_col: d[key_col]} for d in (dict(r) for r in "
+            "cursor.execute(sql).fetchall())\n"
+            "        if str(d.get(value_col, '')) not in guarded\n"
+            "    ]\n"
             'payload = {"rows": rows, "count": len(rows)}\n'
             'return 200, {"Content-Type": "application/json"}, '
             "json.dumps(payload).encode()\n"

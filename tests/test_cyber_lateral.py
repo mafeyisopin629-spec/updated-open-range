@@ -348,3 +348,40 @@ def test_lateral_solves_across_real_containers() -> None:
         assert "secret_flag" in runtime.collect()["leaked_secret_ids"]
     finally:
         runtime.stop()
+
+
+def test_chain_soften_is_reachable_from_real_reports(tmp_path: Path) -> None:
+    # The soften must be OFFERED from a real foothold-engagement report, not merely
+    # work in isolation -- otherwise it's dead in the loop.
+    from cyber_webapp.mutation import _REMOVE_RELEVANCE_FLOOR, available_mutations
+
+    pack = WebappPack()
+    snap = admit(
+        pack,
+        manifest={**_manifest(1), "chain": {"depth": {"min": 2, "max": 2}}},
+        max_repairs=3,
+    )
+    assert isinstance(snap, Snapshot)
+    graph = snap.graph
+    task = next(t for t in snap.tasks if t.meta.get("family") == "webapp.pentest")
+
+    svc = EpisodeService(pack, tmp_path)
+    try:
+        handle = svc.start_episode(snap, task.id)
+        entry = str(graph.nodes[task.entrypoints[0]].attrs["public_url"])
+        _get(svc.base_url(handle), entry)  # reaches the foothold without finishing
+        report = svc.stop_episode(handle)
+    finally:
+        svc.close()
+
+    options = available_mutations(graph, "webapp.pentest", [report])
+    hop = next(
+        (
+            m
+            for m in options
+            if m.direction == "soften" and m.note.startswith("collapse")
+        ),
+        None,
+    )
+    assert hop is not None
+    assert hop.relevance > _REMOVE_RELEVANCE_FLOOR
