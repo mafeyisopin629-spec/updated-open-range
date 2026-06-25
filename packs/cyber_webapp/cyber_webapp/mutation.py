@@ -3,28 +3,30 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from collections.abc import Callable, Mapping, Sequence
 
 from graphschema import Edge, GraphPatch, Node, Visibility, WorldGraph
 from openrange_pack_sdk import EpisodeReportLike, Mutation, Snapshot
 
-from cyber_webapp.ontology import ONTOLOGY_ID
-from cyber_webapp.sampling import _INTERNAL_ONLY_KINDS, _is_networked
+from cyber_webapp.sampling import (
+    _DB_STORE_KINDS,
+    _INTERNAL_ONLY_KINDS,
+    _ORACLE_SHAPES_FOR_LOOT,
+    _is_networked,
+    default_vuln_params,
+)
+from cyber_webapp.vulnerabilities import BODY_SHAPED_KINDS
 from cyber_webapp.vulnerabilities import CATALOG as VULN_CATALOG
 
-# Keep the import alive even though only the validator reads ONTOLOGY_ID.
-_ = ONTOLOGY_ID
-
-# Floor so a "soften by removing this kind" pick is always available
-# even when the path-hit heuristic detects nothing.
+# Guarantees a remove pick exists even when the path-hit heuristic is silent.
 _REMOVE_RELEVANCE_FLOOR = 0.05
 
 # Fixed mid-value: no agent-data signal exists for a kind that isn't in
 # the world yet.
 _ADD_ABSENT_RELEVANCE = 0.5
 
-# Less drastic than fully removing all instances; rotates which exploit
-# the agent has to learn while holding attack-surface count steady.
+# Below remove relevance: rotating the exploit is a softer step than dropping the kind.
 _SWAP_PRESENT_RELEVANCE = 0.2
 
 # Above the decoy harden (0.5) so deepening the chain is the preferred frontier
@@ -87,6 +89,22 @@ def available_mutations(
             ),
         )
 
+    # Rescues an agent stuck ON the chain, which decoy-removal can't. Relevance is the
+    # agent's whole-chain engagement, so it outranks decoy-removal only when the chain
+    # is the focus.
+    chain_vuln_ids = [
+        v.id
+        for v in graph.by_kind("vulnerability")
+        if str(v.attrs.get("kind", "")).startswith("credential")
+    ]
+    hop_soften = _soften_remove_hop_mutation(
+        graph,
+        family_id,
+        _exploitation_score(chain_vuln_ids, paths_per_vuln, path_hits),
+    )
+    if hop_soften is not None:
+        options.append(hop_soften)
+
     options.extend(
         _diversify_swap_kind_mutations(graph, family_id, vulns_by_kind),
     )
@@ -146,7 +164,7 @@ def _harden_add_absent_mutations(
             attrs={
                 "kind": kind,
                 "family": catalog_entry.family,
-                "params": _default_vuln_params(kind, target.id),
+                "params": _default_vuln_params(kind, target),
             },
             visibility=Visibility.HIDDEN,
         )
@@ -216,6 +234,8 @@ def _diversify_swap_kind_mutations(
     networked = _is_networked(graph)
     protected = _protected_kinds(graph)
     existing_kinds_by_target = _existing_kinds_by_target(graph)
+    oracle_endpoints, _ = _oracle_path_targets(graph)
+    oracle_shapes = _oracle_allowed_shapes(graph)
     mutations: list[Mutation] = []
     for kind in sorted(vulns_by_kind):
         if kind in protected:
@@ -232,10 +252,12 @@ def _diversify_swap_kind_mutations(
         target = graph.nodes.get(target_id)
         if target is None:
             continue
+        on_oracle_path = target_id in oracle_endpoints
         alt_kind = _pick_alt_kind(
             current_kind=kind,
             target=target,
             existing_kinds_by_target=existing_kinds_by_target,
+            allowed_shapes=oracle_shapes if on_oracle_path else None,
         )
         if alt_kind is None:
             continue
@@ -248,11 +270,26 @@ def _diversify_swap_kind_mutations(
             attrs={
                 "kind": alt_kind,
                 "family": alt_entry.family,
-                "params": _default_vuln_params(alt_kind, target.id),
+                "params": _default_vuln_params(alt_kind, target),
             },
             visibility=Visibility.HIDDEN,
         )
-        patch = GraphPatch(nodes_updated=[updated_node])
+        updated_nodes = [updated_node]
+        # Mirror the sampler's POST-for-body/GET-else rule so a swapped vuln looks
+        # sampled — but only when it's the endpoint's sole vuln, so a co-located decoy's
+        # method is left alone.
+        method = "POST" if alt_kind in BODY_SHAPED_KINDS else "GET"
+        sole_vuln = sum(1 for _, t in existing_kinds_by_target if t == target.id) == 1
+        if sole_vuln and str(target.attrs.get("method", "GET")) != method:
+            updated_nodes.append(
+                Node(
+                    id=target.id,
+                    kind=target.kind,
+                    attrs={**target.attrs, "method": method},
+                    visibility=target.visibility,
+                )
+            )
+        patch = GraphPatch(nodes_updated=updated_nodes)
         mutations.append(
             Mutation(
                 patch=patch,
@@ -363,6 +400,92 @@ def _harden_append_hop_mutation(
         relevance=_APPEND_HOP_RELEVANCE,
         family=family_id,
         note=f"append a credential hop via {new_host_name}",
+    )
+
+
+def _soften_remove_hop_mutation(
+    graph: WorldGraph,
+    family_id: str,
+    relevance: float,
+) -> Mutation | None:
+    # Re-home the flag store onto the relay's host so the flag stays owned under the
+    # per-service scoped seed CONTAINER uses. Consumes no rng, so the result is
+    # deterministic.
+    terminal = _credential_gated_flag(graph)
+    if terminal is None:
+        return None
+    term_ep_id = _affects_target_id(graph, terminal.id)
+    if term_ep_id is None:
+        return None
+    relay_id = next(
+        (
+            e.src
+            for e in graph.edges.values()
+            if e.kind == "enables" and e.dst == terminal.id
+        ),
+        None,
+    )
+    relay = graph.nodes.get(relay_id) if relay_id is not None else None
+    if relay is None or relay.attrs.get("kind") != "credential_gated_relay":
+        return None  # depth 1: nothing to collapse onto
+    relay_ep_id = _affects_target_id(graph, relay.id)
+    relay_host = _service_of_endpoint(graph, relay_ep_id) if relay_ep_id else None
+    store = _flag_store(graph)
+    if relay_host is None or store is None:
+        return None
+    backed_by = next(
+        (e for e in graph.edges.values() if e.kind == "backed_by" and e.dst == store),
+        None,
+    )
+    if backed_by is None:
+        return None
+    cred_id = next(
+        (
+            e.dst
+            for e in graph.edges.values()
+            if e.kind == "requires_credential" and e.src == term_ep_id
+        ),
+        None,
+    )
+
+    removed_nodes = {terminal.id, term_ep_id}
+    if cred_id is not None:
+        removed_nodes.add(cred_id)
+    relay_params = dict(relay.attrs.get("params", {}))
+    promoted = Node(
+        id=relay.id,
+        kind="vulnerability",
+        attrs={
+            "kind": "credential_gated_flag",
+            "family": str(relay.attrs.get("family", "code_web")),
+            "params": {
+                "credential": relay_params.get("credential", ""),
+                "token_param": relay_params.get("token_param", "token"),
+            },
+        },
+        visibility=Visibility.HIDDEN,
+    )
+    edges_removed = {
+        e.id
+        for e in graph.edges.values()
+        if e.src in removed_nodes or e.dst in removed_nodes
+    }
+    edges_removed.add(backed_by.id)
+    patch = GraphPatch(
+        nodes_updated=[promoted],
+        nodes_removed=sorted(removed_nodes),
+        edges_removed=sorted(edges_removed),
+        edges_added=[_chain_edge(relay_host.id, "backed_by", store)],
+    )
+    return Mutation(
+        patch=patch,
+        direction="soften",
+        relevance=relevance,
+        family=family_id,
+        note=(
+            f"collapse the last credential hop onto "
+            f"{relay_host.attrs.get('name', relay_host.id)}"
+        ),
     )
 
 
@@ -613,6 +736,7 @@ def _pick_alt_kind(
     current_kind: str,
     target: Node,
     existing_kinds_by_target: set[tuple[str, str]],
+    allowed_shapes: frozenset[str] | None = None,
 ) -> str | None:
     target_node_kind = target.kind
     for alt in sorted(VULN_CATALOG):
@@ -622,66 +746,35 @@ def _pick_alt_kind(
             continue
         if target_node_kind not in VULN_CATALOG[alt].target_kinds:
             continue
+        if allowed_shapes is not None and VULN_CATALOG[alt].shape not in allowed_shapes:
+            continue
         return alt
     return None
 
 
-# Vuln-parameter pools mirror sampling.py. Each pool is deterministically
-# indexed by the target id's hash so two calls with the same (kind,
-# target_id) yield the same params.
-_SQLI_PARAMS: tuple[str, ...] = ("q", "query", "search", "term", "filter", "ref")
-_SQLI_TABLES: tuple[str, ...] = (
-    "records",
-    "rows",
-    "items",
-    "data",
-    "entries",
-    "documents",
-)
-_SQLI_COLUMNS: tuple[str, ...] = (
-    "value",
-    "secret",
-    "data",
-    "content",
-    "payload",
-    "body",
-)
-_BROKEN_AUTHZ_HEADERS: tuple[str, ...] = (
-    "X-User-Role",
-    "X-Auth-Role",
-    "X-Internal-Role",
-    "X-Privilege",
-    "X-Service-Role",
-)
-_BROKEN_AUTHZ_VALUES: tuple[str, ...] = (
-    "admin",
-    "root",
-    "superuser",
-    "operator",
-    "service-admin",
-)
-_BROKEN_AUTHZ_FIELDS: tuple[str, ...] = (
-    "value",
-    "data",
-    "secret",
-    "content",
-    "result",
-)
-_SSRF_PARAMS: tuple[str, ...] = (
-    "url",
-    "target",
-    "endpoint",
-    "callback",
-    "redirect",
-    "ref",
-)
-_SSRF_PATTERNS: tuple[str, ...] = (
-    r"^https?://internal\.",
-    r"^https?://int\.",
-    r"^https?://private\.",
-    r"^https?://corp\.",
-    r"^https?://intranet\.",
-)
+def _oracle_allowed_shapes(graph: WorldGraph) -> frozenset[str] | None:
+    # Shapes that can read the flag from its store; see ``_ORACLE_SHAPES_FOR_LOOT``.
+    # ``None`` when there is no flag to constrain.
+    flag = next(
+        (n for n in graph.by_kind("secret") if n.attrs.get("kind") == "flag"), None
+    )
+    if flag is None:
+        return None
+    record = next(
+        (e.src for e in graph.edges.values() if e.kind == "holds" and e.dst == flag.id),
+        None,
+    )
+    store = next(
+        (
+            e.src
+            for e in graph.edges.values()
+            if e.kind == "contains" and e.dst == record
+        ),
+        None,
+    )
+    store_kind = str(graph.nodes[store].attrs.get("kind", "")) if store else ""
+    loot = "db" if store_kind in _DB_STORE_KINDS else "file"
+    return _ORACLE_SHAPES_FOR_LOOT[loot]
 
 
 def _stable_index(seed: str, modulo: int) -> int:
@@ -691,42 +784,9 @@ def _stable_index(seed: str, modulo: int) -> int:
     return int.from_bytes(digest[:8], "big") % modulo
 
 
-def _default_vuln_params(kind: str, target_id: str) -> dict[str, object]:
-    # Keyed by a hash of (kind, target_id) instead of an rng so
-    # ``available_mutations`` stays a pure function. Strings come from
-    # the same pools sampling.py uses so a curriculum-introduced vuln
-    # is indistinguishable from a sampler-introduced one at the
-    # template-rendering layer.
-    seed = f"{kind}:{target_id}"
-    if kind == "sql_injection":
-        return {
-            "target_param": _SQLI_PARAMS[
-                _stable_index(seed + ":param", len(_SQLI_PARAMS))
-            ],
-            "table": _SQLI_TABLES[_stable_index(seed + ":table", len(_SQLI_TABLES))],
-            "leak_column": _SQLI_COLUMNS[
-                _stable_index(seed + ":col", len(_SQLI_COLUMNS))
-            ],
-        }
-    if kind == "ssrf":
-        return {
-            "target_param": _SSRF_PARAMS[
-                _stable_index(seed + ":param", len(_SSRF_PARAMS))
-            ],
-            "allowlist_pattern": _SSRF_PATTERNS[
-                _stable_index(seed + ":pat", len(_SSRF_PATTERNS))
-            ],
-        }
-    if kind == "broken_authz":
-        return {
-            "trust_header": _BROKEN_AUTHZ_HEADERS[
-                _stable_index(seed + ":hdr", len(_BROKEN_AUTHZ_HEADERS))
-            ],
-            "expected_value": _BROKEN_AUTHZ_VALUES[
-                _stable_index(seed + ":val", len(_BROKEN_AUTHZ_VALUES))
-            ],
-            "leak_field": _BROKEN_AUTHZ_FIELDS[
-                _stable_index(seed + ":fld", len(_BROKEN_AUTHZ_FIELDS))
-            ],
-        }
-    return {}
+def _default_vuln_params(kind: str, target: Node) -> dict[str, object]:
+    # Reuse the sampler's builder with a hash-seeded Random (not a live rng) so
+    # ``available_mutations`` stays pure.
+    digest = hashlib.sha256(f"{kind}:{target.id}".encode()).digest()
+    seed = int.from_bytes(digest[:8], "big")
+    return default_vuln_params(kind, target, random.Random(seed))

@@ -163,6 +163,15 @@ ROUTES = {
 ROUTES.setdefault("/", _index)
 ROUTES.setdefault("/openapi.json", _openapi)
 
+# Internal endpoints, dispatched to only by the SSRF proxy — never served to a direct
+# request. This table enforces network segmentation when one process holds the whole
+# world; empty under CONTAINER, where each service is its own host.
+INTERNAL_ROUTES = {
+{% for route in internal_routes %}
+    {{ route.path | tojson }}: {{ route.handler }},
+{% endfor %}
+}
+
 # Each route's required HTTP method. A body-shaped endpoint is mounted as POST and
 # rejects GET, so an exploit must be delivered with the right request shape (a body),
 # not as a query string. Paths absent here (index, discovery) default to GET.

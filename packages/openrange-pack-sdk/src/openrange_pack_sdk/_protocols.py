@@ -289,6 +289,16 @@ class Pack(ABC):
         backing: Backing,
     ) -> RuntimeHandle: ...
 
+    def minimum_backing(self, graph: WorldGraph) -> Backing:
+        """The least-capable backing under which ``graph`` is solvable by a blackbox
+        agent — ``Backing.PROCESS`` (the cheapest) by default. A pack whose worlds
+        need a real filesystem/shell/network overrides this; the training/eval harness
+        escalates each rollout to at least this backing so reward is measured on a
+        substrate where the world is winnable, not silently zero on an emulation the
+        agent can't exploit."""
+        del graph
+        return Backing.PROCESS
+
     def task_families(self) -> list[TaskFamily]:
         return []
 
@@ -374,10 +384,9 @@ class AgentNPC(NPC):
         self._cooldown = 0
         self._agent: Any = None
         self._broken = False
-        # Preflight at construction (when we have a backend already) so a
-        # missing SDK / binary surfaces as soon as the manifest resolves,
-        # not on the first acting tick. Runtime-supplied backends preflight
-        # in ``start()`` instead.
+        # Preflight now (a backend is already supplied) so a missing SDK/binary surfaces
+        # at manifest-resolve, not on the first acting tick. Runtime-supplied backends
+        # preflight in ``start()``.
         if agent_backend is not None:
             try:
                 agent_backend.preflight()
@@ -436,9 +445,8 @@ class AgentNPC(NPC):
             return
         self._broken = True
         self.broken_reason = reason
-        # exc_info=exc (not =True) — for broken-by-config cases there is no
-        # in-flight exception, and ``=True`` would grab whatever
-        # ``sys.exc_info`` returns from an unrelated traceback.
+        # exc_info=exc, not =True: broken-by-config has no in-flight exception, and
+        # ``=True`` would log an unrelated traceback.
         _log.warning(
             "NPC %s is permanently broken (%s); the rest of the episode runs "
             "without it",

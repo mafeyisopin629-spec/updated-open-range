@@ -18,6 +18,7 @@ from openrange.core.admit import AdmissionFailure, admit
 from openrange.core.curriculum import (
     CurriculumPolicy,
     EvolutionGate,
+    SeedGate,
     auto_evolve,
     direction_from_reports,
 )
@@ -33,8 +34,7 @@ RunRound = Callable[[list[PromptRow], list[Snapshot]], RoundReports]
 GateFactory = Callable[[Snapshot], EvolutionGate]
 
 _STALENESS_STEP = 0.1
-# Idle members cap here and fresh children seat here, so a new frontier world is
-# sampled next round instead of evicted before it ever runs.
+# Fresh children seat at this cap so a frontier world survives a round before eviction.
 _MAX_PRIORITY = 2.0
 
 
@@ -71,6 +71,26 @@ def _members_of(
                 difficulty=difficulty,
             )
         )
+
+
+def _gated_members(
+    pack: Pack,
+    manifests: Sequence[Mapping[str, object]],
+    *,
+    difficulty_fn: DifficultyFn,
+    family: str | None,
+    max_repairs: int,
+    seed_gate: SeedGate | None,
+) -> list[_Member]:
+    members: list[_Member] = []
+    for manifest in manifests:
+        result = admit(pack, dict(manifest), max_repairs=max_repairs)
+        if isinstance(result, AdmissionFailure):
+            continue
+        if seed_gate is not None and not seed_gate(result):
+            continue
+        _members_of(result, difficulty_fn(result), family, members)
+    return members
 
 
 def _rows_for(members: Iterable[_Member], num_generations: int) -> list[PromptRow]:
@@ -111,8 +131,8 @@ def _member_priority(
         if subgoals:
             achieved = sum(1 for hit in subgoals.values() if hit)
             gaps.append(1.0 - achieved / len(subgoals))
-    # Regret keeps a world the agent is stuck partway through at the frontier, where
-    # learnability alone (low reward spread) would retire it.
+    # Regret keeps a partly-solved world at the frontier that low reward-spread alone
+    # would retire.
     regret = sum(gaps) / len(gaps) if gaps else 0.0
     return learnability + regret
 
@@ -146,6 +166,7 @@ class WorldPool:
         self._difficulty_fn = difficulty_fn
         self._max_size = max_size
         self._mix_floor = mix_floor
+        self._last_difficulty_gain: float | None = None
 
     @classmethod
     def seed(
@@ -158,13 +179,16 @@ class WorldPool:
         family: str | None = None,
         mix_floor: float = 0.3,
         max_repairs: int = 2,
+        seed_gate: SeedGate | None = None,
     ) -> WorldPool:
-        members: list[_Member] = []
-        for manifest in manifests:
-            result = admit(pack, dict(manifest), max_repairs=max_repairs)
-            if isinstance(result, AdmissionFailure):
-                continue
-            _members_of(result, difficulty_fn(result), family, members)
+        members = _gated_members(
+            pack,
+            manifests,
+            difficulty_fn=difficulty_fn,
+            family=family,
+            max_repairs=max_repairs,
+            seed_gate=seed_gate,
+        )
         return cls(
             members, difficulty_fn=difficulty_fn, max_size=max_size, mix_floor=mix_floor
         )
@@ -226,9 +250,10 @@ class WorldPool:
                 member.priority = _member_priority(ran, reward_fn)
             else:
                 member.priority = min(member.priority + _STALENESS_STEP, _MAX_PRIORITY)
-        grown, capped = self._grow(
+        grown, capped, gain = self._grow(
             reports, pack, policy, gate, gate_factory, evolve_top, max_repairs
         )
+        self._last_difficulty_gain = gain
         self._bound(grown)
         return capped
 
@@ -241,11 +266,10 @@ class WorldPool:
         gate_factory: GateFactory | None,
         evolve_top: int,
         max_repairs: int,
-    ) -> tuple[set[tuple[str, str]], bool]:
+    ) -> tuple[set[tuple[str, str]], bool, float | None]:
         grown: set[tuple[str, str]] = set()
-        # Frontier cap: a member was due to advance but no admissible harder world
-        # passed the gate.
         capped = False
+        gains: list[float] = []
         ran = sorted(
             (m for m in self._members.values() if reports.get(m.key)),
             key=lambda m: (-m.priority, m.key),
@@ -260,9 +284,11 @@ class WorldPool:
                 max_repairs=max_repairs,
             )
             if child is None:
+                # No admissible harder world passed the gate: the frontier is capped.
                 capped = True
                 continue
             difficulty = self._difficulty_fn(child)
+            gains.append(difficulty - member.difficulty)
             for task in child.tasks:
                 if str(task.meta.get("family", "")) != member.family:
                     continue
@@ -277,7 +303,7 @@ class WorldPool:
                         priority=_MAX_PRIORITY,
                     )
                     grown.add(key)
-        return grown, capped
+        return grown, capped, (max(gains) if gains else None)
 
     def _bound(self, protected_extra: set[tuple[str, str]]) -> None:
         protected = self._easy_tier() | protected_extra
@@ -294,6 +320,10 @@ class RoundMetrics:
     train_solve_rate: float
     held_out_solve_rate: float | None = None
     frontier_capped: bool = False
+    # Most any child advanced difficulty this round (signed; None if nothing evolved).
+    # Unlike frontier_capped, near-zero here means children admit but only creep on
+    # cosmetic decoys.
+    difficulty_gain: float | None = None
 
     @property
     def generalization_gap(self) -> float | None:
@@ -320,13 +350,16 @@ class EvalPool:
         difficulty_fn: DifficultyFn,
         family: str | None = None,
         max_repairs: int = 2,
+        seed_gate: SeedGate | None = None,
     ) -> EvalPool:
-        members: list[_Member] = []
-        for manifest in manifests:
-            result = admit(pack, dict(manifest), max_repairs=max_repairs)
-            if isinstance(result, AdmissionFailure):
-                continue
-            _members_of(result, difficulty_fn(result), family, members)
+        members = _gated_members(
+            pack,
+            manifests,
+            difficulty_fn=difficulty_fn,
+            family=family,
+            max_repairs=max_repairs,
+            seed_gate=seed_gate,
+        )
         return cls(members)
 
     def __len__(self) -> int:
@@ -402,6 +435,7 @@ def run_pool_curriculum(
                 train_solve_rate=_mean_pass_rate(reports.values()),
                 held_out_solve_rate=held_out,
                 frontier_capped=capped,
+                difficulty_gain=pool._last_difficulty_gain,
             )
         )
     return metrics

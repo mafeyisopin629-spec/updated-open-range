@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from graphschema import Node, WorldGraph
 from openrange_pack_sdk import PackError
 
+from cyber_webapp.sampling import _is_networked
 from cyber_webapp.vulnerabilities import (
     CATALOG as VULN_CATALOG,
 )
@@ -16,7 +17,7 @@ from cyber_webapp.vulnerabilities import render_vulnerability
 def build_handlers_and_routes(
     graph: WorldGraph,
     only_services: frozenset[str] | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
     # ``only_services`` restricts to one service's own endpoints — the per-service split
     # that the networked CONTAINER backing realizes (each service is its own container).
     services_by_id: dict[str, Node] = {
@@ -39,6 +40,13 @@ def build_handlers_and_routes(
 
     handlers: list[dict[str, str]] = []
     routes: list[dict[str, str]] = []
+    internal_routes: list[dict[str, str]] = []
+    # In a single-process networked world every service shares one server, so a direct
+    # request to an internal ``/svc/<name>`` route would hand over the flag with no SSRF
+    # pivot. Those routes go into ``internal_routes`` (reachable only via the in-process
+    # pivot), making network position the gate as under CONTAINER. A flat world has no
+    # such boundary — every service answers directly, which is the intended solve.
+    segmented = only_services is None and _is_networked(graph)
 
     for endpoint_id, endpoint in endpoints_by_id.items():
         service_id = service_for_endpoint.get(endpoint_id)
@@ -71,22 +79,19 @@ def build_handlers_and_routes(
         handlers.append(
             {"name": handler_name, "body": body, "docstring": docstring},
         )
-        # Single app: every service shares one server, so internal services are
-        # namespaced by ``/svc/<name>`` (public_url). Per-service: each service is its
-        # own container serving on its own port, so it routes on the bare ``path`` and a
-        # caller reaches it at ``http://<service-name><path>``.
+        # Single app: route on namespaced ``public_url`` (/svc/<name>). Per-service
+        # container: route on bare ``path`` (reached at http://<service-name><path>).
         route_path = path if only_services is not None else public_url
         method = str(endpoint.attrs.get("method", "GET"))
-        routes.append(
-            {"path": route_path, "handler": handler_name, "method": method},
-        )
-    return handlers, routes
+        route = {"path": route_path, "handler": handler_name, "method": method}
+        internal = segmented and service.attrs.get("exposure") != "public"
+        (internal_routes if internal else routes).append(route)
+    return handlers, routes, internal_routes
 
 
 def _render_vuln_body(vuln_node: Node) -> str:
-    # An LLM-realized handler stands in for the template — it has passed the dynamic
-    # admission gate (cyber_webapp.realize_admit) before reaching codegen, so it is
-    # treated like any rendered handler from here on.
+    # A realized_handler was already admitted upstream (realize_admit), so use it
+    # verbatim like any rendered template.
     realized = vuln_node.attrs.get("realized_handler")
     if isinstance(realized, str) and realized.strip():
         return _extract_handle_body(realized)

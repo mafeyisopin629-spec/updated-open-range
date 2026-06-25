@@ -43,7 +43,13 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from openrange_pack_sdk import Backing, EpisodeReportLike, Pack, Snapshot
+from openrange_pack_sdk import (
+    Backing,
+    EpisodeReportLike,
+    Pack,
+    Snapshot,
+    resolve_backing,
+)
 
 from openrange.core.curriculum import Direction
 from openrange.core.episode import (
@@ -153,8 +159,7 @@ class EpisodeEnv:
             setattr(self, fn.__name__, _tool_method(self, fn))
 
     if TYPE_CHECKING:
-        # Tools are attached dynamically, so the type checker can't see them;
-        # declare any such access as a string-returning tool call.
+        # Tools are attached dynamically; type them as string-returning tool calls.
         def __getattr__(self, name: str) -> Callable[..., str]: ...
 
     def reset(
@@ -244,20 +249,18 @@ class EpisodeEnv:
             target_url = f"http://target:{surface.get('target_port', '8000')}"
             self._sandbox = AgentSandbox({"base_url": target_url}, network=network)
             self._sandbox.start()
-            # The agent reaches the target by its in-network alias, not the host URL.
             return {**surface, "base_url": target_url, "run": self._sandbox.run}
         self._sandbox = AgentSandbox({"solver_root": surface.get("solver_root")})
         self._sandbox.start()
         return {**surface, "run": self._sandbox.run}
 
     def _teardown_sandbox(self) -> None:
-        # Disposable: the sandbox dies with the episode so no state leaks to the next.
         if self._sandbox is not None:
             self._sandbox.close()
             self._sandbox = None
         if self._network is not None:
-            # Detach the world (best-effort: stop_episode usually removed it already),
-            # then drop the network so nothing dangles even on an un-finalized re-reset.
+            # Best-effort detach (stop_episode usually did it) so the network can be
+            # dropped even on an un-finalized re-reset.
             if self._target_container is not None:
                 _run_docker(
                     "network",
@@ -273,8 +276,7 @@ class EpisodeEnv:
             self._target_container = None
 
     def _finalize(self) -> None:
-        # Idempotent: the reward func may read env.reward more than once, and
-        # stop_episode caches, so a double read is safe.
+        # Idempotent: the reward func may read env.reward more than once.
         if self._finalized or self._handle is None:
             self._finalized = True
             return
@@ -315,6 +317,41 @@ class EpisodeEnv:
 
 def _run_docker(*args: str, check: bool = True) -> None:
     subprocess.run(["docker", *args], check=check, capture_output=True, timeout=60)
+
+
+def _docker_available() -> bool:
+    try:
+        probe = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10, check=False
+        )
+    except Exception:  # noqa: BLE001 — any failure (missing binary, daemon down) means no
+        return False
+    return probe.returncode == 0
+
+
+def _resolve_round_backing(
+    pack: Pack,
+    snapshots: Sequence[Snapshot],
+    *,
+    backing: Backing,
+    sandbox: bool,
+    docker_ok: bool,
+) -> Backing:
+    effective = resolve_backing(backing, backing, sandbox=sandbox)
+    for snapshot in snapshots:
+        effective = resolve_backing(
+            effective, pack.minimum_backing(snapshot.graph), sandbox=sandbox
+        )
+    # Auto-escalation into CONTAINER without Docker would train on an emulation the
+    # agent can't exploit, so fail loud. An explicit CONTAINER (``effective is
+    # backing``) is the caller's own choice.
+    if effective is Backing.CONTAINER and effective is not backing and not docker_ok:
+        raise RuntimeError(
+            "this round needs the CONTAINER backing (a file-read/code-exec world or a "
+            "sandboxed HTTP target) to measure real reward, but Docker is unavailable "
+            "— start Docker, or pass backing=Backing.CONTAINER to see the realize error"
+        )
+    return effective
 
 
 def build_grpo_dataset(snapshot: Snapshot, *, repeat: int = 1) -> list[dict[str, Any]]:
@@ -394,20 +431,25 @@ def make_environment_factory(
     GRPO generation batch are fully isolated. The factory closes over one round's
     ``snapshots`` (often a single, current world); the curriculum re-roots the
     next round by re-building the dataset + factory against the evolved snapshot.
-    ``backing`` picks how each rollout realizes its world — PROCESS by default;
-    CONTAINER (incl. the networked multi-service runtime) trains against the real
-    containerized target. ``sandbox=True`` runs each episode's tools in their own
-    throwaway :class:`AgentSandbox` (HTTP worlds need the CONTAINER backing so the
-    sandbox can join the target's network).
+    ``backing`` is a *floor*, not a fixed choice — PROCESS by default, but each rollout
+    is escalated to at least the round's worlds' ``minimum_backing`` (a file-read /
+    code-exec world is unsolvable, so 0-reward, blackbox on PROCESS) and to CONTAINER
+    when ``sandbox=True`` (the tools run in a throwaway :class:`AgentSandbox` that joins
+    the target's container network). In-band worlds keep the cheap PROCESS substrate. If
+    the escalation reaches CONTAINER but Docker is down the factory raises, rather than
+    silently train on an emulation the agent can't exploit.
     """
     snap_map = {s.snapshot_id: s for s in snapshots}
     base = Path(run_root)
     base.mkdir(parents=True, exist_ok=True)
     tool_list = tuple(tools)
+    effective_backing = _resolve_round_backing(
+        pack, snapshots, backing=backing, sandbox=sandbox, docker_ok=_docker_available()
+    )
 
     def factory() -> EpisodeEnv:
         service = EpisodeService(
-            pack, base / f"env-{uuid.uuid4().hex[:8]}", backing=backing
+            pack, base / f"env-{uuid.uuid4().hex[:8]}", backing=effective_backing
         )
         return EpisodeEnv(
             service=service,
@@ -497,8 +539,8 @@ def make_grpo_rounds(
             if update:
                 holder["model"], holder["peft"] = trainer.model, None
         finally:
-            # TRL builds one env per batch slot and never closes them; without this
-            # each round's CONTAINER worlds (a per-service container stack) leak.
+            # TRL never closes the envs it built; without this each round's CONTAINER
+            # worlds leak.
             for env in getattr(trainer, "environments", None) or []:
                 env._close()
         return collector
@@ -582,8 +624,7 @@ def _report_scalar(
 ) -> float:
     if isinstance(report, EpisodeReport):
         return reward_fn(report).scalar
-    # CurriculumPolicy takes the EpisodeReportLike Protocol, but the trainer only
-    # emits concrete EpisodeReport; this contract fallback needs a fake to hit.
+    # Trainer emits only concrete EpisodeReport; this Protocol fallback needs a fake.
     return 1.0 if report.passed else 0.0  # pragma: no cover
 
 
