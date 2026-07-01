@@ -214,7 +214,7 @@ project test suite confirming no regressions were introduced by the new files.
 **PR Description:** Added MITRE ATT&CK technique tagging to generated cyber tasks. This includes a YAML-based technique classifier, updates to the ontology and pentest task family, and 5 passing tests.
 
 **Maintainer Feedback:**
-- [Awaiting review — no feedback received yet]
+- [Awaiting review | no feedback received yet]
 
 **Status:** Awaiting review
 
