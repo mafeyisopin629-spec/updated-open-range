@@ -33,9 +33,56 @@ from openrange_pack_sdk import Backing, RuntimeHandle
 
 
 def _sample_graph(seed: int = 0) -> WorldGraph:
-    """A graph drawn the way admission draws it — same path the runtime takes."""
-    build_result = WebappPack().make_builder(None).build({"seed": seed})
+    # Pinned to db loot so the response-leak realizer assertions below have a
+    # deterministic shape; file-loot realization is covered separately.
+    build_result = (
+        WebappPack()
+        .make_builder(None)
+        .build({"seed": seed, "loot": {"db": 1, "file": 0}})
+    )
     return build_result.graph
+
+
+def _multi_service_graph() -> WorldGraph:
+    for seed in range(8):
+        graph = _sample_graph(seed)
+        if sum(1 for n in graph.nodes.values() if n.kind == "service") >= 2:
+            return graph
+    raise AssertionError("no multi-service world found in seeds 0-7")
+
+
+def test_build_handlers_filters_to_one_service() -> None:
+    # The per-service split: building for one service sees only its own endpoints.
+    from cyber_webapp.codegen.handlers import build_handlers_and_routes
+
+    graph = _multi_service_graph()
+    services = [n.id for n in graph.nodes.values() if n.kind == "service"]
+    all_handlers, _, _ = build_handlers_and_routes(graph)
+    one_handlers, _, _ = build_handlers_and_routes(graph, frozenset({services[0]}))
+    name = str(graph.nodes[services[0]].attrs.get("name", services[0]))
+    assert 0 < len(one_handlers) < len(all_handlers)
+    assert all(h["name"].startswith(f"handle__{name}__") for h in one_handlers)
+
+
+def test_per_service_seed_confines_the_flag() -> None:
+    # The per-service split keeps the flag in exactly the service that owns it, so the
+    # public service never holds (or even watches for) the internal flag.
+    from cyber_webapp.codegen.seeding import project_seed
+
+    graph = _multi_service_graph()
+    flag = next(
+        str(n.attrs["value_ref"])
+        for n in graph.nodes.values()
+        if n.kind == "secret" and n.attrs.get("kind") == "flag"
+    )
+    services = [n.id for n in graph.nodes.values() if n.kind == "service"]
+    owners = [
+        sid
+        for sid in services
+        if flag in json.dumps(dict(project_seed(graph, frozenset({sid}))), default=str)
+    ]
+    assert len(owners) == 1  # the flag lives in exactly one service
+    assert flag in json.dumps(dict(project_seed(graph)), default=str)  # unscoped has it
 
 
 def test_realize_graph_emits_app_and_seed_files() -> None:
@@ -56,11 +103,11 @@ def test_realize_graph_app_py_compiles_across_seeds() -> None:
 
 
 def test_realize_graph_seed_json_carries_expected_keys() -> None:
-    """seed.json is valid JSON and carries accounts/secrets/records/schema."""
+    """seed.json is valid JSON and carries secrets/records/schema."""
     files = _realize_graph(_sample_graph())
     payload = json.loads(files[SEED_FILE_NAME])
     assert isinstance(payload, dict)
-    for key in ("accounts", "secrets", "records", "schema"):
+    for key in ("secrets", "records", "schema"):
         assert key in payload, f"seed.json missing top-level key {key!r}"
     # The schema is what the SQLi handler reads against — must name a table
     # and the column we'll be SELECTing on.
@@ -112,11 +159,13 @@ def test_pack_realize_satisfies_runtime_handle_protocol() -> None:
     assert isinstance(handle, RuntimeHandle)
 
 
-def test_pack_realize_rejects_non_process_backings() -> None:
-    """Only Backing.PROCESS is wired today; the others must raise."""
+def test_pack_realize_routes_backings() -> None:
+    """PROCESS and CONTAINER are wired (constructing CONTAINER needs no docker — the
+    build happens at reset); the still-unwired backings must raise."""
     graph = _sample_graph()
     pack = WebappPack()
-    for backing in (Backing.CONTAINER, Backing.SIMULATOR, Backing.HYBRID):
+    assert isinstance(pack.realize(graph, Backing.CONTAINER), RuntimeHandle)
+    for backing in (Backing.SIMULATOR, Backing.HYBRID):
         with pytest.raises(NotImplementedError):
             pack.realize(graph, backing)
 

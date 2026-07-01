@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from cyber_webapp.verify import accepts
 from openrange_pack_sdk import (
     LLMBackendError,
     LLMRequest,
@@ -24,8 +25,9 @@ from openrange_pack_sdk import (
     TaskSpec,
 )
 
+from openrange.agent import agent_briefing
 from openrange.agent_backend import CodexAgentBackend
-from openrange.core import PACKS, auto_evolve
+from openrange.core import PACKS, auto_evolve, consequence_gate
 from openrange.core.episode import AgentTurn, EpisodeReport
 from openrange.llm import CodexBackend
 from openrange.runtime import (
@@ -148,7 +150,14 @@ def main() -> None:
                 "report": report.as_dict(),
             }
         )
-        evolved = auto_evolve(snapshot, report, pack=pack, llm=curriculum_llm)
+        # Gate so a "harden" add that actually leaks the flag (easier) is skipped.
+        evolved = auto_evolve(
+            snapshot,
+            report,
+            pack=pack,
+            llm=curriculum_llm,
+            gate=consequence_gate(pack, run.root / "_gate", accepts),
+        )
         if evolved is None:
             break
         snapshot = evolved
@@ -183,7 +192,7 @@ def _codex_solver(harness: CodexHarness) -> Solver:
 
     def solve(ctx: EpisodeContext) -> AgentTurn:
         try:
-            result = harness.run(ctx.task.instruction, ctx.root)
+            result = harness.run(agent_briefing(ctx), ctx.root)
             return AgentTurn(message=result.text)
         except LLMBackendError as exc:
             print(f"agent backend failed on {ctx.task.id}: {exc}", flush=True)

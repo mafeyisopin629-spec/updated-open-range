@@ -22,6 +22,7 @@ from typing import Any
 from cyber_webapp.families.build import WebappBuild
 from cyber_webapp.families.pentest import WebappPentest
 from cyber_webapp.invariants import (
+    credential_reuse_binding,
     no_orphan_nodes,
     oracle_path_exists,
     secret_must_be_held,
@@ -263,9 +264,7 @@ class _StubWebappPack(Pack):
 
 
 def test_cyber_ontology_is_valid() -> None:
-    """The new cyber ontology declares 10 node kinds + 11 edge kinds
-    (the two old `affects` rows collapse into one EdgeKind with 2
-    endpoint pairs)."""
+    """The cyber ontology declares the expected node and edge kinds."""
     o = webapp_ontology()
     assert o.id == "cyber.webapp@v2"
     assert set(o.node_kinds) == {
@@ -378,6 +377,109 @@ def test_oracle_path_exists_fails_when_vuln_removed() -> None:
     assert any(i.code == "no_oracle_chain" for i in issues)
 
 
+def _binding_chain(*, producer: str | None = "v_leak") -> WorldGraph:
+    # leak -enables-> gate; the gate's endpoint requires a credential. `producer`
+    # is the vuln that `produces` that credential (None = nobody produces it).
+    g = WorldGraph(ontology=ONTOLOGY_ID)
+    g.add_node(
+        Node(
+            "v_leak",
+            "vulnerability",
+            attrs={"kind": "credential_leak"},
+            visibility=Visibility.HIDDEN,
+        )
+    )
+    g.add_node(
+        Node(
+            "v_gate",
+            "vulnerability",
+            attrs={"kind": "credential_gated_flag"},
+            visibility=Visibility.HIDDEN,
+        )
+    )
+    g.add_node(Node("ep_gate", "endpoint", attrs={"path": "/internal/vault"}))
+    g.add_node(Node("cred", "credential", attrs={"kind": "token", "value_ref": "tok0"}))
+    g.add_edge(Edge("e_aff", "affects", "v_gate", "ep_gate"))
+    g.add_edge(Edge("e_en", "enables", "v_leak", "v_gate"))
+    g.add_edge(Edge("e_req", "requires_credential", "ep_gate", "cred"))
+    if producer is not None:
+        g.add_edge(Edge("e_prod", "produces", producer, "cred"))
+    return g
+
+
+def test_credential_binding_accepts_a_valid_chain() -> None:
+    assert credential_reuse_binding(_binding_chain()) == []
+
+
+def test_credential_binding_rejects_an_unproduced_credential() -> None:
+    issues = credential_reuse_binding(_binding_chain(producer=None))
+    assert any(i.code == "credential_binding" for i in issues)
+
+
+def test_credential_binding_rejects_a_producer_not_strictly_earlier() -> None:
+    # The consuming gate produces its own required credential — not obtainable
+    # before the gate, so the binding is unsatisfiable.
+    issues = credential_reuse_binding(_binding_chain(producer="v_gate"))
+    assert any(i.code == "credential_binding" for i in issues)
+
+
+def test_credential_binding_rejects_a_swapped_chain_kind() -> None:
+    # A diversify swap that rewrites a chain hop's kind in place (keeping its
+    # produces edge) must be caught, or an unsolvable world admits clean.
+    g = _binding_chain()
+    g.nodes["v_leak"].attrs["kind"] = "idor"
+    assert any(i.code == "credential_binding" for i in credential_reuse_binding(g))
+
+
+def test_credential_binding_rejects_two_producers() -> None:
+    g = _binding_chain()
+    g.add_node(
+        Node(
+            "v_leak2",
+            "vulnerability",
+            attrs={"kind": "credential_leak"},
+            visibility=Visibility.HIDDEN,
+        )
+    )
+    g.add_edge(Edge("e_prod2", "produces", "v_leak2", "cred"))
+    assert any(i.code == "credential_binding" for i in credential_reuse_binding(g))
+
+
+def test_credential_binding_rejects_when_no_gate_vuln() -> None:
+    # The required endpoint's only vuln is no longer a gate kind (a swap rewrote
+    # it), so nothing actually consumes the credential it gates on.
+    g = _binding_chain()
+    g.nodes["v_gate"].attrs["kind"] = "idor"
+    assert any(i.code == "credential_binding" for i in credential_reuse_binding(g))
+
+
+def test_credential_binding_rejects_when_producer_cannot_reach_gate() -> None:
+    # Producer is a valid hop but no enables path reaches the gate (an enables
+    # cycle that never arrives), so the gate's credential is unobtainable.
+    g = WorldGraph(ontology=ONTOLOGY_ID)
+    for vid, kind in (
+        ("v_leak", "credential_leak"),
+        ("v_relay", "credential_gated_relay"),
+        ("v_gate", "credential_gated_flag"),
+    ):
+        g.add_node(
+            Node(
+                vid,
+                "vulnerability",
+                attrs={"kind": kind},
+                visibility=Visibility.HIDDEN,
+            )
+        )
+    g.add_node(Node("ep_gate", "endpoint", attrs={"path": "/internal/vault"}))
+    g.add_node(Node("cred", "credential", attrs={"kind": "token", "value_ref": "t"}))
+    g.add_edge(Edge("e_prod", "produces", "v_leak", "cred"))
+    g.add_edge(Edge("e_aff", "affects", "v_gate", "ep_gate"))
+    g.add_edge(Edge("e_req", "requires_credential", "ep_gate", "cred"))
+    g.add_edge(Edge("e_en1", "enables", "v_leak", "v_relay"))
+    g.add_edge(Edge("e_en2", "enables", "v_relay", "v_leak"))
+    assert any(i.code == "credential_binding" for i in credential_reuse_binding(g))
+
+
 def test_real_webapp_pack_identity() -> None:
     """The pack registers under id `webapp`, ships two families."""
     from cyber_webapp import WebappPack
@@ -435,8 +537,9 @@ def test_real_webapp_pack_seed_yields_distinct_worlds() -> None:
 
 def test_real_webapp_pack_lineage_carries_pack_provenance() -> None:
     """The Snapshot's lineage captures pack id, version, attempt count,
-    and the builder's admission_meta (seed, prior source, etc.)."""
+    and the builder's admission_meta (seed, prior source, world difficulty)."""
     from cyber_webapp import WebappPack
+    from cyber_webapp.difficulty import world_difficulty
 
     snap = admit(WebappPack(), manifest={"seed": 0})
     assert isinstance(snap, Snapshot)
@@ -445,6 +548,8 @@ def test_real_webapp_pack_lineage_carries_pack_provenance() -> None:
     assert snap.lineage["builder"] == "cyber.webapp.v2"
     assert snap.lineage["seed"] == 0
     assert "prior_source" in snap.lineage
+    # the #322 solve-path-cost metric is persisted, queryable without recompute
+    assert snap.lineage["world_difficulty"] == float(world_difficulty(snap.graph))
 
 
 def test_real_webapp_pack_history_records_all_phases() -> None:
@@ -508,33 +613,113 @@ def test_pentest_instruction_uses_public_url_not_internal_path() -> None:
 
 
 def test_realizer_serves_endpoints_at_their_public_url() -> None:
-    """End-to-end: the live HTTP server mounts each endpoint at exactly the
-    `public_url` the graph declares. No hidden URL convention."""
+    """End-to-end honesty invariant on PROCESS for a segmented (networked) world: the
+    server mounts each PUBLIC endpoint at its `public_url`; an internal-service endpoint
+    answers only an in-process pivot, so a direct request both 404s AND never carries
+    flag; and the SSRF pivot still recovers the flag. Together these are the regression
+    guard for the direct-GET-the-metadata-host leak — a pure 404 check would miss a
+    future variant that 404s one internal path but leaks the flag from another."""
     import time
     import urllib.error
     import urllib.request
 
-    from cyber_webapp import WebappPack
+    from cyber_webapp import WebappPack, _is_networked
+    from cyber_webapp.reference_solver import solve_chain
 
-    snap = admit(WebappPack(), manifest={"seed": 42})
+    snap = admit(WebappPack(), manifest={"seed": 3, "topology": "company"})
     assert isinstance(snap, Snapshot)
+    graph = snap.graph
+    assert _is_networked(graph)  # a company estate is segmented; the guard applies
+    flag = str(graph.nodes["secret_flag"].attrs["value_ref"])
+    service_of = {e.dst: e.src for e in graph.edges.values() if e.kind == "exposes"}
+    task = next(t for t in snap.tasks if t.meta.get("family") == "webapp.pentest")
+    entry = str(graph.nodes[task.entrypoints[0]].attrs["public_url"])
     pack = WebappPack()
-    handle = pack.realize(snap.graph, Backing.PROCESS)
+    handle = pack.realize(graph, Backing.PROCESS)
     handle.reset()
-    surface = handle.surface()
-    base_url = str(surface["base_url"])
+    base_url = str(handle.surface()["base_url"])
+
+    def fetch(path: str) -> str:
+        try:
+            with urllib.request.urlopen(base_url + path, timeout=5) as resp:
+                raw: bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+        return raw.decode("utf-8", "replace")
+
     try:
         time.sleep(0.3)
-        for ep in snap.graph.by_kind("endpoint"):
+        for ep in graph.by_kind("endpoint"):
+            path = str(ep.attrs["public_url"])
+            try:
+                with urllib.request.urlopen(base_url + path, timeout=5) as resp:
+                    status, body = resp.status, resp.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as exc:
+                status, body = exc.code, exc.read().decode("utf-8", "replace")
+            assert flag not in body, (
+                f"{ep.id} ({path!r}) leaked the flag on a direct GET"
+            )
+            internal = graph.nodes[service_of[ep.id]].attrs.get("exposure") != "public"
+            if internal:
+                assert status == 404, (
+                    f"internal endpoint {ep.id} ({path!r}) answered a direct request "
+                    f"(status {status}); it must be pivot-only"
+                )
+            else:
+                assert status != 404, (
+                    f"endpoint {ep.id} declared public_url={path!r} but returned 404"
+                )
+        # The intended path still works: the SSRF pivot recovers the flag.
+        fetch(entry)
+        assert flag in solve_chain(graph, fetch).terminal
+    finally:
+        handle.stop()
+
+
+def test_flat_world_internal_endpoints_answer_directly() -> None:
+    """The segmentation guard is gated on a SEGMENTED world. A flat (non-networked)
+    world has no network boundary, so its internal-service endpoints are reachable by a
+    direct request — the intended solve there. This pins the `_is_networked` gate so
+    a future over-broad generalization can't silently 404 a flat world's solve path."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    from cyber_webapp import WebappPack, _is_networked
+
+    pack = WebappPack()
+    graph = None
+    internal_eps: list[Any] = []
+    for seed in range(20):
+        candidate = admit(pack, manifest={"seed": seed})
+        assert isinstance(candidate, Snapshot)
+        cg = candidate.graph
+        service_of = {e.dst: e.src for e in cg.edges.values() if e.kind == "exposes"}
+        eps = [
+            ep
+            for ep in cg.by_kind("endpoint")
+            if cg.nodes[service_of[ep.id]].attrs.get("exposure") != "public"
+        ]
+        if not _is_networked(cg) and eps:
+            graph, internal_eps = cg, eps
+            break
+    assert graph is not None, "no flat world with internal endpoints in seeds 0-19"
+
+    handle = pack.realize(graph, Backing.PROCESS)
+    handle.reset()
+    base_url = str(handle.surface()["base_url"])
+    try:
+        time.sleep(0.3)
+        for ep in internal_eps:
             url = base_url + str(ep.attrs["public_url"])
             try:
-                with urllib.request.urlopen(url, timeout=5) as r:
-                    status = r.status
-            except urllib.error.HTTPError as e:
-                status = e.code
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
             assert status != 404, (
-                f"endpoint {ep.id} declared public_url={ep.attrs['public_url']!r} "
-                f"but the realizer returned 404"
+                f"flat-world internal endpoint {ep.id} 404'd — segmentation must not "
+                f"apply to a non-networked world"
             )
     finally:
         handle.stop()

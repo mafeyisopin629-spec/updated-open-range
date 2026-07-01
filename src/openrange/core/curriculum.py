@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from graphschema import (
@@ -28,6 +29,8 @@ from openrange_pack_sdk import (
     TaskSpec,
 )
 
+from openrange.core.episode import EpisodeService
+
 if TYPE_CHECKING:
     from openrange_pack_sdk import Snapshot
 
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
 Direction = Literal["harden", "soften", "diversify"]
 
 CurriculumPolicy = Callable[[Sequence[EpisodeReportLike]], "Direction | None"]
+
+_DIFFICULTY_STEP: dict[str, float] = {"harden": 0.2, "soften": -0.2}
 
 
 def direction_from_reports(
@@ -62,6 +67,59 @@ def _report_passed(report: EpisodeReportLike) -> bool:
         return False
 
 
+EvolutionGate = Callable[["Snapshot", Mutation], bool]
+
+SeedGate = Callable[["Snapshot"], bool]
+
+
+def _verify_realized(
+    pack: Pack,
+    root: Path,
+    snapshot: Snapshot,
+    accept: Callable[[Snapshot, str], bool],
+) -> bool:
+    # No realizable task: fail closed (reject) rather than pass blind.
+    task = next((t for t in snapshot.tasks if t.entrypoints), None)
+    if task is None:
+        return False
+    svc = EpisodeService(pack, root)
+    try:
+        handle = svc.start_episode(snapshot, task.id)
+        return accept(snapshot, str(svc.surface(handle)["base_url"]))
+    finally:
+        svc.close()
+
+
+def consequence_gate(
+    pack: Pack,
+    workdir: str | Path,
+    accept: Callable[[Snapshot, str], bool],
+) -> EvolutionGate:
+    """An :data:`EvolutionGate` that realizes each evolved world and keeps it only when
+    ``accept(snapshot, base_url)`` confirms it — a pack-supplied check run against the
+    realized world. ``accept`` is the pack's verdict, so core needs no pack import. A
+    world with no realizable task can't be checked, so it is rejected."""
+    root = Path(workdir)
+
+    def gate(evolved: Snapshot, mutation: Mutation) -> bool:
+        del mutation
+        return _verify_realized(pack, root, evolved, accept)
+
+    return gate
+
+
+def consequence_seed_gate(
+    pack: Pack,
+    workdir: str | Path,
+    accept: Callable[[Snapshot, str], bool],
+) -> SeedGate:
+    """A :data:`SeedGate` that applies the same ``accept`` verdict as
+    :func:`consequence_gate`, but at pool construction — so an initial world seeds the
+    pool only if its reference breach actually leaks against the realized world."""
+    root = Path(workdir)
+    return lambda snapshot: _verify_realized(pack, root, snapshot, accept)
+
+
 def auto_evolve(
     snapshot: Snapshot,
     *reports: EpisodeReportLike,
@@ -69,6 +127,7 @@ def auto_evolve(
     policy: CurriculumPolicy = direction_from_reports,
     llm: LLMBackend | None = None,
     max_repairs: int = 2,
+    gate: EvolutionGate | None = None,
 ) -> Snapshot | None:
     """Pick an evolution for ``direction`` and re-admit it.
 
@@ -76,6 +135,10 @@ def auto_evolve(
     world, falls back to a builder *grow* (re-running the builder with a
     difficulty-stepped prior). Returns the next Snapshot, or ``None`` if nothing
     admits.
+
+    ``gate``, when given, vets each admitted candidate against its claimed
+    ``direction`` (see :data:`EvolutionGate`); a rejected candidate is skipped
+    so a mislabelled mutation never lands.
     """
     if not reports:
         return None
@@ -87,11 +150,20 @@ def auto_evolve(
     for chosen in _patch_candidates(pack, snapshot, reports, direction, llm=llm):
         try:
             evolved = _evolve_snapshot(snapshot, pack, chosen, max_repairs=max_repairs)
-        except Exception:  # noqa: BLE001 — pack-supplied code is untrusted
+        except Exception:  # noqa: BLE001
             continue
-        if evolved is not None and evolved.snapshot_id != snapshot.snapshot_id:
-            return evolved
+        if evolved is None or evolved.snapshot_id == snapshot.snapshot_id:
+            continue
+        if gate is not None:
+            try:
+                if not gate(evolved, chosen):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+        return evolved
 
+    # Intentionally outside the gate: a pack using grow for a monotone frontier
+    # must keep ``default_prior`` None so this fallback never fires there.
     try:
         return _grow_snapshot(snapshot, pack, direction, max_repairs=max_repairs)
     except Exception:  # noqa: BLE001 — pack-supplied code is untrusted
@@ -139,7 +211,7 @@ def _grow_snapshot(
     baseline = pack.default_prior()
     if baseline is None:
         return None
-    step = {"harden": 0.2, "soften": -0.2}.get(direction)
+    step = _DIFFICULTY_STEP.get(direction)
     if step is None:
         return None
     carried = snapshot.lineage.get("curriculum_difficulty")
@@ -165,10 +237,27 @@ def _grow_snapshot(
         return None
     grown = _with_grow_lineage(result, snapshot, direction, stepped)
     if grown.snapshot_id == snapshot.snapshot_id:
-        # Builder ignored the bump and rebuilt the same world; refuse it so the
-        # lineage stays a chain rather than looping back on itself.
         return None
     return grown
+
+
+def _evolve_block(
+    *,
+    parent_snapshot_id: str,
+    direction: str,
+    kind: str,
+    relevance: float | None = None,
+    family: str | None = None,
+    note: str = "",
+) -> dict[str, object]:
+    return {
+        "parent_snapshot_id": parent_snapshot_id,
+        "direction": direction,
+        "kind": kind,
+        "relevance": relevance,
+        "family": family,
+        "note": note,
+    }
 
 
 def _with_grow_lineage(
@@ -194,11 +283,11 @@ def _with_grow_lineage(
         lineage={
             **dict(result.lineage),
             "curriculum_difficulty": difficulty,
-            "_evolve": {
-                "parent_snapshot_id": parent.snapshot_id,
-                "direction": direction,
-                "kind": "grow",
-            },
+            "_evolve": _evolve_block(
+                parent_snapshot_id=parent.snapshot_id,
+                direction=direction,
+                kind="grow",
+            ),
         },
         history=(*result.history, event),
     )
@@ -226,25 +315,12 @@ def _evolve_snapshot(
         dict(manifest_in) if isinstance(manifest_in, dict) else {}
     )
 
-    # Regenerate tasks from the evolved graph — a mutation that changes a
-    # task's shape (e.g. build's difficulty level) has to reach the agent's
-    # instruction, not just the graph.
     regenerated: list[TaskSpec] = []
     for family in pack.task_families():
         regenerated.extend(family.generate(evolved_graph, base_manifest, None))
 
     wrapped = _PreBuiltPack(pack, evolved_graph, regenerated)
-    evolved_manifest = {
-        **base_manifest,
-        "_evolve": {
-            "parent_snapshot_id": snapshot.snapshot_id,
-            "direction": mutation.direction,
-            "relevance": mutation.relevance,
-            "family": mutation.family,
-            "note": mutation.note,
-        },
-    }
-    result = admit(wrapped, manifest=evolved_manifest, max_repairs=max_repairs)
+    result = admit(wrapped, manifest=dict(base_manifest), max_repairs=max_repairs)
     if isinstance(result, AdmissionFailure):
         return None
     assert isinstance(result, _Snapshot)
@@ -260,12 +336,18 @@ def _evolve_snapshot(
         ),
         refs=(snapshot.snapshot_id,),
     )
-    # Carry accumulated grow difficulty across patch steps so a later grow
-    # resumes from it rather than from baseline.
     carried = snapshot.lineage.get("curriculum_difficulty")
     lineage = dict(result.lineage)
     if isinstance(carried, dict):
         lineage.setdefault("curriculum_difficulty", carried)
+    lineage["_evolve"] = _evolve_block(
+        parent_snapshot_id=snapshot.snapshot_id,
+        direction=mutation.direction,
+        kind="patch",
+        relevance=mutation.relevance,
+        family=mutation.family,
+        note=mutation.note,
+    )
     return _Snapshot(
         snapshot_id=result.snapshot_id,
         ontology_id=result.ontology_id,

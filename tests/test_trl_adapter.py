@@ -5,7 +5,7 @@ SWE episodes (per ``.rules``, no mocks): the actuators mutate a real
 ``solver_root``, the reward bridge grades the real edited tree through
 ``episode_reward``, and the variance policy reads real ``EpisodeReport``s. This
 proves the integration is correct — it does not measure a model (that is the
-``examples/trl_grpo_lora.ipynb`` notebook + the gated ``tests/test_trl_live.py``).
+gated ``tests/test_trl_live.py``).
 
 Some tests stop a real episode, which shells out to a sandboxed pytest to grade —
 the same path the SWE pack's own tests take.
@@ -13,16 +13,14 @@ the same path the SWE pack's own tests take.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
-from openrange_pack_sdk import EpisodeResult, Snapshot
+from openrange_pack_sdk import Backing, EpisodeResult, Snapshot
 from openrange_trl import (
     EpisodeEnv,
-    FileWorkspaceTools,
-    OpenRangeEnv,
-    WorkspaceError,
     build_grpo_dataset,
     env_trajectory,
     make_environment_factory,
@@ -35,8 +33,89 @@ from swe.instances import load_instance
 from openrange.core.admit import AdmissionFailure, admit
 from openrange.core.curriculum import auto_evolve
 from openrange.core.episode import EpisodeReport, EpisodeService
+from openrange.training import Reward
 
-EnvMaker = Callable[[str], tuple[OpenRangeEnv, Snapshot]]
+EnvMaker = Callable[[str], tuple[EpisodeEnv, Snapshot]]
+
+
+def _in_root(surface: Mapping[str, Any], path: str) -> Path:
+    root = Path(str(surface["solver_root"])).resolve()
+    target = (root / path).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"path {path!r} escapes the workspace root")
+    return target
+
+
+def read_file(surface: Mapping[str, Any], path: str) -> str:
+    """Read a workspace file.
+
+    Args:
+        path: Path to the file or directory, relative to the workspace root.
+    """
+    return _in_root(surface, path).read_text(encoding="utf-8")
+
+
+def write_file(surface: Mapping[str, Any], path: str, content: str) -> str:
+    """Write a file in the workspace.
+
+    Args:
+        path: Path to the file or directory, relative to the workspace root.
+        content: The full text to write into the file.
+    """
+    target = _in_root(surface, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} byte(s) to {path}"
+
+
+def list_dir(surface: Mapping[str, Any], path: str = ".") -> str:
+    """List the entries of a workspace directory.
+
+    Args:
+        path: Path to the file or directory, relative to the workspace root.
+    """
+    target = _in_root(surface, path)
+    if not target.exists():
+        raise ValueError(f"no such directory: {path!r}")
+    if target.is_file():
+        return path
+    names = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+    return "\n".join(names) if names else "(empty)"
+
+
+def apply_patch(surface: Mapping[str, Any], path: str, find: str, replace: str) -> str:
+    """Replace exact text in a workspace file.
+
+    Args:
+        path: Path to the file or directory, relative to the workspace root.
+        find: The exact text to search for in the file.
+        replace: The text to substitute for every match.
+    """
+    target = _in_root(surface, path)
+    original = target.read_text(encoding="utf-8")
+    if find not in original:
+        raise ValueError(f"patch text not found in {path!r}")
+    occurrences = original.count(find)
+    target.write_text(original.replace(find, replace), encoding="utf-8")
+    return f"patched {path} ({occurrences} occurrence(s))"
+
+
+def run_tests(surface: Mapping[str, Any], node_ids: str = "") -> str:
+    """Run the workspace's own pytest suite (never the held-out grader).
+
+    Args:
+        node_ids: Space-separated pytest targets; empty runs the whole suite.
+    """
+    fn = surface.get("run_tests")
+    if not callable(fn):
+        return "error: this world exposes no run_tests tool"
+    res = fn(node_ids.split() or None)
+    verb = "passed" if res.get("ok") else "failed"
+    head = f"tests {verb} (returncode={res.get('returncode')})"
+    return f"{head}\n{str(res.get('stdout') or '').strip() or '(no output)'}"
+
+
+FILE_TOOLS = (read_file, write_file, list_dir, apply_patch, run_tests)
 
 
 def _admit(instance: str) -> Snapshot:
@@ -51,11 +130,15 @@ def make_env(tmp_path: Path) -> Iterator[EnvMaker]:
     every service is closed on teardown so no grading subprocess leaks."""
     services: list[EpisodeService] = []
 
-    def _make(instance: str) -> tuple[OpenRangeEnv, Snapshot]:
+    def _make(instance: str) -> tuple[EpisodeEnv, Snapshot]:
         snapshot = _admit(instance)
         service = EpisodeService(SwePack(), tmp_path / f"svc{len(services)}")
         services.append(service)
-        env = OpenRangeEnv(service=service, snapshots={snapshot.snapshot_id: snapshot})
+        env = EpisodeEnv(
+            service=service,
+            snapshots={snapshot.snapshot_id: snapshot},
+            tools=FILE_TOOLS,
+        )
         return env, snapshot
 
     yield _make
@@ -63,19 +146,81 @@ def make_env(tmp_path: Path) -> Iterator[EnvMaker]:
         service.close()
 
 
-def _solve(env: OpenRangeEnv, instance: str) -> None:
+def _solve(env: EpisodeEnv, instance: str) -> None:
     for path, content in load_instance(instance).gold_files.items():
         env.write_file(path, content)
 
 
+def test_factories_thread_backing_into_each_rollout_service(tmp_path: Path) -> None:
+    # The factory builds each service before any realize, so the backing it threads
+    # through is observable without booting docker — and the default must stay PROCESS.
+    snapshot = _admit("calc_sum")
+    default_factory = make_environment_factory(
+        SwePack(), [snapshot], tmp_path / "proc", tools=FILE_TOOLS
+    )
+    container_factory = make_environment_factory(
+        SwePack(),
+        [snapshot],
+        tmp_path / "cont",
+        tools=FILE_TOOLS,
+        backing=Backing.CONTAINER,
+    )
+    proc_env = default_factory()
+    cont_env = container_factory()
+    try:
+        assert proc_env.service.backing is Backing.PROCESS
+        assert cont_env.service.backing is Backing.CONTAINER
+    finally:
+        proc_env.service.close()
+        cont_env.service.close()
+
+
 def test_base_env_resets_with_no_tools(tmp_path: Path) -> None:
-    # The tool-less EpisodeEnv base is usable directly: reset starts a real
-    # episode and returns the default observation (subclasses override it).
+    # The env is usable with no tools at all: reset starts a real episode and
+    # returns the live interface contract (here, the SWE workspace listing).
     snapshot = _admit("calc_sum")
     service = EpisodeService(SwePack(), tmp_path / "base")
     env = EpisodeEnv(service=service, snapshots={snapshot.snapshot_id: snapshot})
     try:
-        assert env.reset() == "Environment ready."
+        assert env.reset().startswith("Workspace ready")
+    finally:
+        service.close()
+
+
+def test_env_close_releases_the_service(tmp_path: Path) -> None:
+    # TRL builds envs from a factory and never closes them, so env._close() is the
+    # only hook to stop the live episode + warm worlds. Without it, CONTAINER rollouts
+    # leak a container stack per env. _close() is idempotent and safe before any reset.
+    snapshot = _admit("calc_sum")
+    service = EpisodeService(SwePack(), tmp_path / "close")
+    env = EpisodeEnv(service=service, snapshots={snapshot.snapshot_id: snapshot})
+    env.reset(snapshot_id=snapshot.snapshot_id)
+    assert service._episodes  # a live episode is registered
+    env._close()
+    assert not service._episodes  # closed: nothing left running
+    env._close()  # idempotent
+
+
+def test_only_brought_tools_are_exposed(tmp_path: Path) -> None:
+    # TRL reflects every public env method except `reset` into a policy tool, so a
+    # lifecycle hook like close must stay private.
+    import inspect
+
+    def my_tool(surface: Mapping[str, Any]) -> str:
+        return "ok"
+
+    snapshot = _admit("calc_sum")
+    service = EpisodeService(SwePack(), tmp_path / "tools")
+    env = EpisodeEnv(
+        service=service, snapshots={snapshot.snapshot_id: snapshot}, tools=[my_tool]
+    )
+    try:
+        visible = {
+            n
+            for n, _ in inspect.getmembers(env, predicate=inspect.ismethod)
+            if n != "reset" and not n.startswith("_")
+        }
+        assert visible == {"my_tool"}, f"non-tool methods leaked to TRL: {visible}"
     finally:
         service.close()
 
@@ -102,61 +247,6 @@ class TestBuildDataset:
         snapshot = _admit("calc_sum")
         base = build_grpo_dataset(snapshot)
         assert len(build_grpo_dataset(snapshot, repeat=3)) == 3 * len(base)
-
-
-class TestFileWorkspaceTools:
-    def test_write_read_roundtrip(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path)
-        assert tools.write_file("pkg/mod.py", "x = 1\n").startswith("wrote")
-        assert tools.read_file("pkg/mod.py") == "x = 1\n"
-
-    def test_list_dir_marks_subdirs(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path)
-        tools.write_file("a.py", "")
-        tools.write_file("sub/b.py", "")
-        listing = tools.list_dir(".")
-        assert "a.py" in listing
-        assert "sub/" in listing
-
-    def test_apply_patch_replaces_text(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path)
-        tools.write_file("m.py", "return 0\n")
-        assert "1 occurrence" in tools.apply_patch("m.py", "0", "42")
-        assert tools.read_file("m.py") == "return 42\n"
-
-    def test_apply_patch_missing_text_raises(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path)
-        tools.write_file("m.py", "a\n")
-        with pytest.raises(WorkspaceError):
-            tools.apply_patch("m.py", "nope", "x")
-
-    def test_apply_patch_missing_file_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(WorkspaceError):
-            FileWorkspaceTools(tmp_path).apply_patch("gone.py", "a", "b")
-
-    def test_list_dir_on_a_file_returns_its_path(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path)
-        tools.write_file("solo.py", "")
-        assert tools.list_dir("solo.py") == "solo.py"
-
-    def test_list_dir_on_empty_root_is_marked(self, tmp_path: Path) -> None:
-        assert FileWorkspaceTools(tmp_path).list_dir(".") == "(empty)"
-
-    def test_list_dir_missing_dir_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(WorkspaceError):
-            FileWorkspaceTools(tmp_path).list_dir("nope")
-
-    def test_read_missing_file_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(WorkspaceError):
-            FileWorkspaceTools(tmp_path).read_file("nope.py")
-
-    def test_traversal_escape_is_refused(self, tmp_path: Path) -> None:
-        tools = FileWorkspaceTools(tmp_path / "root")
-        with pytest.raises(WorkspaceError):
-            tools.write_file("../escape.py", "pwned")
-        with pytest.raises(WorkspaceError):
-            tools.read_file("../../etc/passwd")
-        assert not (tmp_path / "escape.py").exists()
 
 
 class TestEnvLifecycle:
@@ -280,9 +370,9 @@ class TestRewardSpread:
 
     def _reward_after(
         self,
-        env: OpenRangeEnv,
+        env: EpisodeEnv,
         snapshot: Snapshot,
-        edit: Callable[[OpenRangeEnv], object],
+        edit: Callable[[EpisodeEnv], object],
     ) -> float:
         env.reset(snapshot_id=snapshot.snapshot_id)
         edit(env)
@@ -379,7 +469,9 @@ class TestTrajectoryExport:
 class TestEnvFactory:
     def test_factory_isolates_concurrent_envs(self, tmp_path: Path) -> None:
         snapshot = _admit("calc_sum")
-        factory = make_environment_factory(SwePack(), [snapshot], tmp_path)
+        factory = make_environment_factory(
+            SwePack(), [snapshot], tmp_path, tools=FILE_TOOLS
+        )
         a, b = factory(), factory()
         try:
             a.reset(snapshot_id=snapshot.snapshot_id)
@@ -433,6 +525,15 @@ class TestVariancePolicy:
 
     def test_empty_is_none(self) -> None:
         assert reward_variance_policy([]) is None
+
+    def test_keys_on_the_supplied_reward_fn(self) -> None:
+        losing = _report(False, {"a": False, "b": False})
+        winning = _report(True, {"a": True, "b": True})
+        assert reward_variance_policy([losing, winning]) is None
+        collapsed = reward_variance_policy(
+            [losing, winning], reward_fn=lambda _r: Reward(scalar=0.4)
+        )
+        assert collapsed == "soften"
 
     def test_plugs_into_auto_evolve_noop_for_swe(self) -> None:
         # The policy is a CurriculumPolicy; auto_evolve accepts it. SWE opts out

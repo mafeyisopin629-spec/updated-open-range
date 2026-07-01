@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from graphschema import Node, WorldGraph
+from graphschema import WorldGraph
 from openrange_pack_sdk import PackError
+
+from cyber_webapp.consequence import guarded_values
 
 _DEFAULT_TABLE = "records"
 _DEFAULT_KEY_COLUMN = "key"
@@ -17,67 +19,149 @@ _DEFAULT_VALUE_COLUMN = "value"
 _BROKEN_AUTHZ_LEAK_FIELDS = ("value", "data", "secret", "content", "result", "flag")
 
 
-def project_seed(graph: WorldGraph) -> Mapping[str, object]:
+def project_seed(
+    graph: WorldGraph, only_services: frozenset[str] | None = None
+) -> Mapping[str, object]:
     """Project the runtime seed payload.
 
-    Raises :class:`PackError` if the graph has no flag-kind secret.
+    The flag lives in exactly one place, fixed by the loot shape: a "db" loot
+    keeps it in the in-memory records/secrets (read via a response-leak
+    exploit); a "file" loot keeps it in the in-memory file map (read via a
+    file-read exploit). It never lands on disk. Raises :class:`PackError` if
+    the graph has no flag-kind secret.
+
+    ``only_services`` scopes the seed to the given services' own stores — the
+    per-service split the networked backing realizes (one container per service).
+    Each service then carries only the secrets/records/files of the data_stores it
+    is ``backed_by``, so the flag stays confined to the one service that owns it.
     """
     flag = ""
-    accounts: dict[str, dict[str, object]] = {}
+    flag_secret_id = ""
     secrets: dict[str, str] = {}
-    records: dict[str, dict[str, object]] = {}
+    raw_records: dict[str, tuple[str, dict[str, str]]] = {}
 
-    creds_by_account: dict[str, str] = {}
-    for edge in graph.edges.values():
-        if edge.kind == "has_credential":
-            creds_by_account[edge.src] = edge.dst
-    cred_by_id: dict[str, Node] = {
-        n.id: n for n in graph.nodes.values() if n.kind == "credential"
-    }
+    service_of_record, service_of_secret = _service_ownership(graph)
+
+    def _owned(service_id: str | None) -> bool:
+        # Unscoped → everything; scoped → only the targeted services' own state.
+        return only_services is None or service_id in only_services
 
     for node in graph.nodes.values():
         if node.kind == "secret" and node.attrs.get("kind") == "flag":
+            if not _owned(service_of_secret.get(node.id)):
+                continue
             flag = str(node.attrs.get("value_ref", ""))
+            flag_secret_id = node.id
         elif node.kind == "secret":
+            if not _owned(service_of_secret.get(node.id)):
+                continue
             secrets[str(node.attrs.get("kind", node.id))] = str(
                 node.attrs.get("value_ref", ""),
             )
-        elif node.kind == "account":
-            cred_id = creds_by_account.get(node.id)
-            password = ""
-            if cred_id is not None:
-                cred = cred_by_id.get(cred_id)
-                if cred is not None:
-                    password = str(cred.attrs.get("value_ref", ""))
-            accounts[str(node.attrs.get("username", node.id))] = {
-                "role": str(node.attrs.get("role", "user")),
-                "password": password,
-            }
         elif node.kind == "record":
+            if not _owned(service_of_record.get(node.id)):
+                continue
             fields = node.attrs.get("fields", {})
-            if isinstance(fields, Mapping):
-                records[str(node.attrs.get("key", node.id))] = {
-                    str(k): str(v) for k, v in fields.items()
-                }
-            else:
-                records[str(node.attrs.get("key", node.id))] = {}
+            clean = (
+                {str(k): str(v) for k, v in fields.items()}
+                if isinstance(fields, Mapping)
+                else {}
+            )
+            raw_records[node.id] = (str(node.attrs.get("key", node.id)), clean)
 
-    if not flag:
+    # Unscoped: a world must have a flag. Scoped: a service that doesn't own the
+    # flag legitimately has none — it carries only its own (decoy) state.
+    if only_services is None and not flag:
         raise PackError("graph has no flag-kind secret; codegen needs one")
 
+    store_kind_of_record = _store_kind_by_record(graph)
+    if flag:
+        flag_record_id = _record_holding(graph, flag_secret_id)
+        loot_shape = store_kind_of_record.get(flag_record_id, "kv")
+    else:
+        loot_shape = "file"  # no flag in this slice → no flag injected into db/secrets
+
+    db_records: dict[str, dict[str, str]] = {}
+    files: dict[str, str] = {}
+    for rec_id, (key, fields) in raw_records.items():
+        if store_kind_of_record.get(rec_id) == "file":
+            files[key] = fields.get("value", "")
+        else:
+            db_records[key] = fields
+
     schema = _derive_sql_schema(graph)
-    records_for_schema = _retarget_records(records, schema, flag)
-    secrets_with_flag = _populate_secrets_with_flag(secrets, flag)
+    if loot_shape == "file":
+        # Flag lives in the file map only; db records / secrets carry decoys
+        # so a stray response-leak vuln can't reach it.
+        records_for_schema = _retarget_records(db_records, schema, flag="")
+        secrets_out: dict[str, str] = dict(secrets)
+        files_out = _populate_files(files)
+    else:
+        records_for_schema = _retarget_records(db_records, schema, flag)
+        secrets_out = _populate_secrets_with_flag(secrets, flag)
+        files_out = {}
 
     return MappingProxyType(
         {
             "flag": flag,
-            "accounts": accounts,
-            "secrets": secrets_with_flag,
+            "secrets": secrets_out,
             "records": records_for_schema,
+            "files": files_out,
             "schema": schema,
+            # The values the runtime watches for at the response boundary — every
+            # HIDDEN node's value_ref, by node id. Same source the offline verifier
+            # (consequence.detect_leak) reads, so live and test agree by construction.
+            # Scoped to this slice's own secrets so the public service never holds
+            # (or watches for) the internal flag.
+            "guarded": {
+                k: v
+                for k, v in guarded_values(graph).items()
+                if _owned(service_of_secret.get(k))
+            },
         },
     )
+
+
+def _service_ownership(
+    graph: WorldGraph,
+) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    # Which service owns each record / secret, via service -backed_by-> store
+    # -contains-> record -holds-> secret. Used to split the seed per service.
+    service_of_store = {
+        e.dst: e.src for e in graph.edges.values() if e.kind == "backed_by"
+    }
+    store_of_record = {
+        e.dst: e.src for e in graph.edges.values() if e.kind == "contains"
+    }
+    record_of_secret = {e.dst: e.src for e in graph.edges.values() if e.kind == "holds"}
+    service_of_record: dict[str, str | None] = {
+        rec: service_of_store.get(store) for rec, store in store_of_record.items()
+    }
+    service_of_secret: dict[str, str | None] = {
+        sec: service_of_record.get(rec) for sec, rec in record_of_secret.items()
+    }
+    return service_of_record, service_of_secret
+
+
+def _store_kind_by_record(graph: WorldGraph) -> dict[str, str]:
+    contains: dict[str, str] = {
+        e.dst: e.src for e in graph.edges.values() if e.kind == "contains"
+    }
+    store_kind: dict[str, str] = {
+        n.id: str(n.attrs.get("kind", "")) for n in graph.by_kind("data_store")
+    }
+    return {rec: store_kind.get(store, "") for rec, store in contains.items()}
+
+
+def _record_holding(graph: WorldGraph, secret_id: str) -> str:
+    for edge in graph.edges.values():
+        if edge.kind == "holds" and edge.dst == secret_id:
+            return edge.src
+    return ""
+
+
+def _populate_files(files: Mapping[str, str]) -> dict[str, str]:
+    return {k: str(v) for k, v in files.items()}
 
 
 def _derive_sql_schema(graph: WorldGraph) -> Mapping[str, str]:

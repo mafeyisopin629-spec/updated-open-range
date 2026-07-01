@@ -245,17 +245,6 @@ def webapp_ontology() -> Ontology:
                 endpoints=[("account", "credential")],
                 description="this account authenticates with this credential",
             ),
-            "can_access": EdgeKind(
-                "can_access",
-                endpoints=[("account", "endpoint")],
-                attrs={
-                    "auth_method": s(
-                        AttrType.STRING,
-                        description="how the account authenticates to this endpoint",
-                    ),
-                },
-                description="legitimate access — the agent's negative space",
-            ),
             "runs_on": EdgeKind(
                 "runs_on",
                 endpoints=[("service", "host")],
@@ -287,10 +276,17 @@ def webapp_ontology() -> Ontology:
                 endpoints=[("vulnerability", "vulnerability")],
                 description="a vuln chain: A enables exploitation of B",
             ),
-            "derives": EdgeKind(
-                "derives",
-                endpoints=[("credential", "secret")],
-                description="a credential whose value comes from this secret",
+            "produces": EdgeKind(
+                "produces",
+                endpoints=[("vulnerability", "credential")],
+                description="exploiting this weakness yields this credential",
+            ),
+            "requires_credential": EdgeKind(
+                "requires_credential",
+                endpoints=[("endpoint", "credential")],
+                description=(
+                    "this endpoint grants access only when this credential is presented"
+                ),
             ),
         },
     )

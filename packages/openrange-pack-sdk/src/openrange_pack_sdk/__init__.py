@@ -14,6 +14,10 @@ from openrange_pack_sdk._errors import (
     OpenRangeError,
     PackError,
 )
+from openrange_pack_sdk._generate import (
+    WorldAuthor,
+    realize_verified,
+)
 from openrange_pack_sdk._helpers import (
     add_edge,
     add_node,
@@ -34,6 +38,7 @@ from openrange_pack_sdk._protocols import (
     EpisodeReportLike,
     LLMBackend,
     Pack,
+    PoolableRuntime,
     RuntimeHandle,
     TaskFamily,
 )
@@ -59,6 +64,7 @@ from openrange_pack_sdk._types import (
     Snapshot,
     TaskSeed,
     TaskSpec,
+    resolve_backing,
 )
 
 __all__ = [
@@ -89,6 +95,7 @@ __all__ = [
     "Pack",
     "PackError",
     "PackPrior",
+    "PoolableRuntime",
     "ProceduralBuilder",
     "RuntimeHandle",
     "SandboxResult",
@@ -97,14 +104,17 @@ __all__ = [
     "TaskFamily",
     "TaskSeed",
     "TaskSpec",
+    "WorldAuthor",
     "add_edge",
     "add_node",
     "edge_id",
+    "resolve_backing",
     "manifest_bool",
     "manifest_float",
     "manifest_int",
     "manifest_list",
     "manifest_str",
+    "realize_verified",
     "run_submission",
     "write_tree",
 ]

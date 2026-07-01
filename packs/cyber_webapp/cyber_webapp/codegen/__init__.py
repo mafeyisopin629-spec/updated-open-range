@@ -16,28 +16,35 @@ from cyber_webapp.codegen.seeding import project_seed
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
-def _realize_graph(graph: WorldGraph) -> dict[str, str]:
-    # Secret must never land on disk — app.py loads seed into memory then unlinks.
-    seed = project_seed(graph)
-    handlers, routes = build_handlers_and_routes(graph)
-    discovery = build_discovery(graph)
+def _realize_graph(
+    graph: WorldGraph, only_services: frozenset[str] | None = None
+) -> dict[str, str]:
+    # ``only_services`` renders one service in isolation (its own endpoints + its own
+    # state) — the per-service app the networked CONTAINER backing runs per service.
+    # Default (None) renders the whole world into one app (PROCESS / single-container).
+    seed = project_seed(graph, only_services)
+    handlers, routes, internal_routes = build_handlers_and_routes(graph, only_services)
+    discovery = build_discovery(graph, only_services)
 
     template = _jinja_env().get_template("app.py.j2")
     source = template.render(
         handlers=handlers,
         routes=routes,
+        internal_routes=internal_routes,
         discovery=discovery,
     )
 
-    accounts = cast("Mapping[str, Mapping[str, object]]", seed["accounts"])
     secrets = cast("Mapping[str, object]", seed["secrets"])
     records = cast("Mapping[str, Mapping[str, object]]", seed["records"])
+    files = cast("Mapping[str, object]", seed["files"])
     schema = cast("Mapping[str, object]", seed["schema"])
+    guarded = cast("Mapping[str, object]", seed["guarded"])
     seed_payload = {
-        "accounts": {k: dict(v) for k, v in accounts.items()},
         "secrets": dict(secrets),
         "records": {k: dict(v) for k, v in records.items()},
+        "files": dict(files),
         "schema": dict(schema),
+        "guarded": dict(guarded),
     }
     seed_json = json.dumps(seed_payload, sort_keys=True, indent=2)
 

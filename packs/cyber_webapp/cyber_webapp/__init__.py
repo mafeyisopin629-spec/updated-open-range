@@ -14,15 +14,27 @@ from openrange_pack_sdk import (
 )
 
 from cyber_webapp.builder import WebappBuilder
+from cyber_webapp.container import minimum_backing
 from cyber_webapp.families import WebappBuild, WebappPentest
 from cyber_webapp.invariants import (
+    credential_reuse_binding,
+    credential_value_binding,
+    flag_confined_to_gate,
     no_orphan_nodes,
     oracle_path_exists,
     secret_must_be_held,
     sqli_targets_db_backed_service,
+    unique_vuln_per_endpoint,
 )
+from cyber_webapp.mutation import monotone_chain_gate
 from cyber_webapp.ontology import ONTOLOGY_ID, webapp_ontology
-from cyber_webapp.realize import WebappRuntime, WebappRuntimeError
+from cyber_webapp.realize import (
+    ContainerWebappRuntime,
+    NetworkedContainerWebappRuntime,
+    WebappRuntime,
+    WebappRuntimeError,
+)
+from cyber_webapp.sampling import _is_networked as _is_networked  # re-export
 
 
 class WebappPack(Pack):
@@ -43,6 +55,10 @@ class WebappPack(Pack):
             secret_must_be_held,
             oracle_path_exists,
             sqli_targets_db_backed_service,
+            credential_reuse_binding,
+            credential_value_binding,
+            flag_confined_to_gate,
+            unique_vuln_per_endpoint,
         ]
 
     def make_builder(self, prior: PackPrior | None) -> Builder:
@@ -53,7 +69,18 @@ class WebappPack(Pack):
         graph: WorldGraph,
         backing: Backing,
     ) -> RuntimeHandle:
-        return WebappRuntime(graph, backing)
+        if backing is Backing.CONTAINER:
+            if _is_networked(graph):
+                return NetworkedContainerWebappRuntime(graph)
+            return ContainerWebappRuntime(graph)
+        if backing is Backing.PROCESS:
+            return WebappRuntime(graph)
+        raise NotImplementedError(f"webapp pack does not support backing={backing!r}")
+
+    def minimum_backing(self, graph: WorldGraph) -> Backing:
+        from cyber_webapp.container import minimum_backing
+
+        return minimum_backing(graph)
 
     def task_families(self) -> list[TaskFamily]:
         return [WebappBuild(), WebappPentest()]
@@ -61,12 +88,19 @@ class WebappPack(Pack):
 
 __all__ = [
     "ONTOLOGY_ID",
+    "ContainerWebappRuntime",
+    "NetworkedContainerWebappRuntime",
     "WebappBuild",
     "WebappBuilder",
     "WebappPack",
     "WebappPentest",
     "WebappRuntimeError",
     "WebappRuntime",
+    "credential_reuse_binding",
+    "credential_value_binding",
+    "flag_confined_to_gate",
+    "minimum_backing",
+    "monotone_chain_gate",
     "no_orphan_nodes",
     "oracle_path_exists",
     "secret_must_be_held",
