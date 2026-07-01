@@ -209,15 +209,14 @@ project test suite confirming no regressions were introduced by the new files.
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when submitted]
+**PR Link:** https://github.com/vecna-labs/open-range/pull/359
 
-**PR Description:** [Draft or final PR description - much of the content above can be adapted]
+**PR Description:** Added MITRE ATT&CK technique tagging to generated cyber tasks. This includes a YAML-based technique classifier, updates to the ontology and pentest task family, and 5 passing tests.
 
 **Maintainer Feedback:**
-- [Date]: [Summary of feedback received]
-- [Date]: [How you addressed it]
+- [Awaiting review — no feedback received yet]
 
-**Status:** [Awaiting review / Iterating / Approved / Merged]
+**Status:** Awaiting review
 
 ---
 
