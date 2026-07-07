@@ -78,6 +78,12 @@ not related to this issue.
    "MITRE" were inside `contribution_readme.md` which is not part 
    of the project source code.
 
+### Expected vs. Actual Behavior
+
+**Expected:** Generated cyber tasks should include a `technique_id` field that maps to a MITRE ATT&CK technique (e.g., `T1190`, `T1059`), making it easy to identify the attack technique each task represents.
+
+**Actual:** Generated cyber tasks contain no `technique_id` field whatsoever. Searching the entire codebase for `technique_id` and `MITRE` returns zero results in source code, confirming the feature is completely absent.
+
 ### Reproduction Evidence
 - **Commit showing reproduction:** 
   https://github.com/mafeyisopin629-spec/updated-open-range/tree/fix-issue-88
