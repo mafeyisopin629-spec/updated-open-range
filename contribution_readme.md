@@ -201,9 +201,12 @@ project test suite confirming no regressions were introduced by the new files.
 - Created `tests/test_technique_classifier.py` with 5 passing tests
 
 **Challenges faced:**
-- `uv` command not found on Windows, resolved using `python -m uv`
-- hydra keyword conflict between T1078 and T1110, resolved by
-  removing hydra from T1078 keywords in the YAML file
+
+- **Windows PATH issue with `uv`:** Running `uv` directly in the terminal failed with "command not found" on Windows. After investigating, I discovered that `uv` was installed but not added to the Windows PATH. I resolved this by prefixing all commands with `python -m`, using `python -m uv run pytest` instead of `uv run pytest`. This became my standard approach for the rest of the project.
+
+- **Keyword conflict between MITRE techniques:** The keyword "hydra" was initially mapped to T1078 (Valid Accounts) in `mitre_techniques.yaml`, but it was incorrectly matching commands related to T1110 (Brute Force) since Hydra is a well-known brute force tool. I caught this during testing when a brute force command was being tagged with the wrong technique ID. I resolved it by removing "hydra" from T1078's keyword list entirely to avoid false positives.
+
+- **Merge conflict in `pentest.py`:** When opening the PR, the upstream repo had updated `families/pentest.py` while I was working on my branch. I resolved the conflict using VS Code's built-in merge editor, selecting "Accept Both Changes" to preserve both my `technique_id` logic and the upstream's new task structure, then committed and pushed the resolution.
 
 **Code Changes:**
 - **Files modified:** `ontology.py`, `families/pentest.py`
