@@ -223,16 +223,20 @@ project test suite confirming no regressions were introduced by the new files.
 ## Learnings & Reflections
 
 ### Technical Skills Gained
-
-[What you learned technically]
+- Learned how to build a YAML-based keyword classifier in Python and integrate it into an existing codebase without breaking existing functionality
+- Gained hands-on experience with MITRE ATT&CK framework concepts and how technique IDs map to real attack behaviors
+- Learned how to resolve merge conflicts using VS Code's built-in conflict editor when upstream changes collided with my branch
+- Discovered that Windows PATH issues with `uv` require using `python -m uv` instead of calling `uv` directly — a non-obvious environment quirk that took real debugging to find
 
 ### Challenges Overcome
-
-[What was hard and how you solved it]
+- **Keyword conflicts:** The keyword "hydra" initially matched the wrong MITRE technique. I caught this during testing and removed it from the keyword list to avoid false positives — a reminder that classifiers need careful review, not just coverage
+- **Merge conflict:** The upstream repo updated `pentest.py` while I was working on my branch. I resolved the conflict using VS Code's "Accept Both Changes" option to preserve both my new `technique_id` logic and the upstream's updated task structure
+- **Windows environment:** Running `uv` directly failed due to PATH issues on Windows. I worked around this by using `python -m uv run pytest` instead, and wrote helper Python scripts for commands that were too long to run reliably in the terminal
 
 ### What I'd Do Differently Next Time
-
-[Reflection on your process]
+- I would add more MITRE techniques to the classifier from the start rather than limiting to 5, since expanding it later requires re-testing all keyword mappings
+- I would set up the upstream remote earlier in the process so merge conflicts are caught and resolved incrementally rather than all at once before the PR
+- I would write the expected vs. actual behavior documentation during Phase II while the issue was freshest in my mind, rather than relying on memory later
 
 ---
 
